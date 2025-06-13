@@ -67,6 +67,17 @@ class ProfileManager:
             # Добавляем задержку для имитации человеческого поведения
             time.sleep(random.uniform(2, 4))
             result = self.client.account_edit(full_name=full_name)
+            
+            # Если успешно обновлено в Instagram, обновляем в базе данных
+            if result:
+                from database.db_manager import update_instagram_account
+                success, message = update_instagram_account(self.account_id, full_name=full_name)
+
+                if not success:
+                    logger.warning(f"Имя профиля обновлено в Instagram, но не обновлено в базе данных: {message}")
+                else:
+                    logger.info(f"Имя профиля успешно обновлено в Instagram и в базе данных")
+            
             return True, "Имя профиля успешно обновлено"
         except Exception as e:
             logger.error(f"Ошибка при обновлении имени профиля: {e}")
@@ -105,6 +116,17 @@ class ProfileManager:
             # Добавляем задержку для имитации человеческого поведения
             time.sleep(random.uniform(2, 4))
             result = self.client.account_edit(biography=biography)
+            
+            # Если успешно обновлено в Instagram, обновляем в базе данных
+            if result:
+                from database.db_manager import update_instagram_account
+                success, message = update_instagram_account(self.account_id, biography=biography)
+
+                if not success:
+                    logger.warning(f"Биография обновлена в Instagram, но не обновлена в базе данных: {message}")
+                else:
+                    logger.info(f"Биография успешно обновлена в Instagram и в базе данных")
+            
             return True, "Описание профиля успешно обновлено"
         except Exception as e:
             logger.error(f"Ошибка при обновлении описания профиля: {e}")

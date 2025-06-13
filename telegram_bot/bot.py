@@ -14,6 +14,7 @@ from telegram_bot.handlers.account_handlers import (
 from telegram_bot.states import BULK_ADD_ACCOUNTS
 from telegram_bot.handlers.task_handlers import retry_task_callback
 from telegram_bot.handlers.profile_handlers import get_profile_handlers, profile_setup_menu
+from profile_setup import get_profile_handlers as get_profile_setup_handlers
 #from instagram.clip_upload_patch import *
 
 
@@ -473,8 +474,12 @@ def setup_bot(updater):
     for handler in get_all_handlers():
         dp.add_handler(handler)
 
-    # Добавляем обработчики для настройки профиля
+    # Добавляем обработчики для настройки профиля (старые)
     for handler in get_profile_handlers():
+        dp.add_handler(handler)
+
+    # Добавляем обработчики из profile_setup модулей
+    for handler in get_profile_setup_handlers():
         dp.add_handler(handler)
 
     # Добавляем обработчик для файлов с аккаунтами
