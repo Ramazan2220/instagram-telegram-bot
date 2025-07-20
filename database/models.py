@@ -14,6 +14,14 @@ account_proxy = Table(
     Column('proxy_id', Integer, ForeignKey('proxies.id'), primary_key=True)
 )
 
+# Таблица связи между аккаунтами и группами
+account_groups = Table(
+    'account_groups',
+    Base.metadata,
+    Column('account_id', Integer, ForeignKey('instagram_accounts.id'), primary_key=True),
+    Column('group_id', Integer, ForeignKey('account_groups_table.id'), primary_key=True)
+)
+
 class TaskStatus(enum.Enum):
     PENDING = "pending"
     PROCESSING = "processing"
@@ -27,6 +35,21 @@ class TaskType(enum.Enum):
     CAROUSEL = "carousel"
     STORY = "story"
     REEL = "reel"
+    REELS = "reels"  # Добавляем для совместимости
+    IGTV = "igtv"
+
+class AccountGroup(Base):
+    __tablename__ = 'account_groups_table'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    icon = Column(String(10), default='📁')  # Эмодзи иконка для группы
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    # Отношения
+    accounts = relationship("InstagramAccount", secondary=account_groups, back_populates="groups")
 
 class Proxy(Base):
     __tablename__ = 'proxies'
@@ -52,24 +75,32 @@ class InstagramAccount(Base):
     password = Column(String(255), nullable=False)
     email = Column(String(255))
     email_password = Column(String(255))
+    phone = Column(String(255))  # Телефон
+    website = Column(String(255))  # Веб-сайт
     full_name = Column(String(255))  # Добавляем поле для полного имени
     biography = Column(Text)  # Добавляем поле для описания профиля
+    device_id = Column(String(255), nullable=True)  # Уникальный ID устройства для Instagram
     is_active = Column(Boolean, default=True)
+    status = Column(String(50), default='active')  # Статус аккаунта: active, inactive, banned, etc.
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     session_data = Column(Text)
+    last_error = Column(Text, nullable=True)  # Последняя ошибка при проверке
+    last_check = Column(DateTime, nullable=True)  # Время последней проверки
 
     # Отношения
     proxies = relationship("Proxy", secondary=account_proxy, back_populates="accounts")
     tasks = relationship("PublishTask", back_populates="account")
     proxy_id = Column(Integer, ForeignKey('proxies.id'), nullable=True)
     proxy = relationship("Proxy", foreign_keys=[proxy_id])
+    groups = relationship("AccountGroup", secondary=account_groups, back_populates="accounts")
 
 class PublishTask(Base):
     __tablename__ = 'publish_tasks'
 
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey('instagram_accounts.id'), nullable=False)
+    user_id = Column(Integer, nullable=True)  # ID пользователя Telegram который создал задачу
     task_type = Column(Enum(TaskType), nullable=False)
     status = Column(Enum(TaskStatus), default=TaskStatus.PENDING)
     media_path = Column(String(255), nullable=True)  # Путь к медиафайлу
@@ -95,6 +126,9 @@ class PublishTask(Base):
     # Для рилс
     audio_path = Column(String(255), nullable=True)  # Путь к аудиофайлу для рилс
     audio_start_time = Column(Float, nullable=True)  # Время начала аудио
+    
+    # ID опубликованного поста в Instagram
+    media_id = Column(String(255), nullable=True)  # ID медиа в Instagram после публикации
 
     # Отношения
     account = relationship("InstagramAccount", back_populates="tasks")
@@ -134,3 +168,98 @@ class Log(Base):
 
     # Дополнительные данные
     data = Column(JSON, nullable=True)  # Дополнительные данные в формате JSON
+
+class WarmupStatus(enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class WarmupTask(Base):
+    __tablename__ = 'warmup_tasks'
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey('instagram_accounts.id'), nullable=False)
+    status = Column(Enum(WarmupStatus), default=WarmupStatus.PENDING)
+    settings = Column(JSON, nullable=False)  # Настройки прогрева
+    progress = Column(JSON, nullable=True)  # Прогресс выполнения
+    error = Column(Text, nullable=True)  # Сообщение об ошибке
+    created_at = Column(DateTime, default=datetime.now)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    # Отношения
+    account = relationship("InstagramAccount")
+
+class FollowTaskStatus(enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    STOPPED = "stopped"
+
+class FollowSourceType(enum.Enum):
+    FOLLOWERS = "followers"      # Подписчики аккаунта
+    FOLLOWING = "following"       # Подписки аккаунта
+    HASHTAG = "hashtag"          # По хештегу
+    LOCATION = "location"        # По геолокации
+    LIKERS = "likers"           # Лайкнувшие пост
+    COMMENTERS = "commenters"    # Комментаторы поста
+
+class FollowTask(Base):
+    __tablename__ = 'follow_tasks'
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey('instagram_accounts.id'), nullable=False)
+    name = Column(String(255), nullable=False)  # Название задачи
+    source_type = Column(Enum(FollowSourceType), nullable=False)
+    source_value = Column(String(255), nullable=False)  # username, hashtag, location name или URL поста
+    status = Column(Enum(FollowTaskStatus), default=FollowTaskStatus.PENDING)
+    
+    # Настройки скорости
+    follows_per_hour = Column(Integer, default=20)
+    follow_limit = Column(Integer, default=500)  # Лимит подписок для задачи
+    
+    # Фильтры
+    filters = Column(JSON, nullable=True)  # skip_private, skip_no_avatar, only_business, min_followers, max_followers
+    
+    # Статистика
+    followed_count = Column(Integer, default=0)  # Количество выполненных подписок
+    skipped_count = Column(Integer, default=0)   # Количество пропущенных аккаунтов
+    failed_count = Column(Integer, default=0)    # Количество неудачных попыток
+    
+    # Список обработанных пользователей (чтобы не подписываться дважды)
+    processed_users = Column(JSON, default=list)  # Список user_id уже обработанных
+    
+    # Время
+    created_at = Column(DateTime, default=datetime.now)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    last_action_at = Column(DateTime, nullable=True)  # Время последней подписки
+    
+    # Ошибки
+    error = Column(Text, nullable=True)
+    
+    # Отношения
+    account = relationship("InstagramAccount")
+
+# Таблица для хранения уникальных подписок для каждого аккаунта
+class FollowHistory(Base):
+    __tablename__ = 'follow_history'
+    
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey('instagram_accounts.id'), nullable=False)
+    target_user_id = Column(String(255), nullable=False)  # ID пользователя в Instagram
+    target_username = Column(String(255), nullable=True)  # Username для истории
+    followed_at = Column(DateTime, default=datetime.now)
+    unfollowed_at = Column(DateTime, nullable=True)  # Если отписались
+    task_id = Column(Integer, ForeignKey('follow_tasks.id'), nullable=True)
+    
+    # Отношения
+    account = relationship("InstagramAccount")
+    task = relationship("FollowTask")

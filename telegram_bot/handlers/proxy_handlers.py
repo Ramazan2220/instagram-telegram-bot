@@ -124,9 +124,17 @@ def add_proxy_handler(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def list_proxies_handler(update: Update, context: CallbackContext):
-    """Показывает список прокси"""
+    """Показывает список прокси с пагинацией"""
     query = update.callback_query
     query.answer()
+
+    # Извлекаем номер страницы из callback_data
+    page = 1
+    if query.data.startswith("list_proxies_page_"):
+        try:
+            page = int(query.data.split("_")[-1])
+        except (ValueError, IndexError):
+            page = 1
 
     proxies = get_proxies()
 
@@ -145,13 +153,20 @@ def list_proxies_handler(update: Update, context: CallbackContext):
         )
         return ConversationHandler.END
 
+    # Пагинация: показываем по 5 прокси на страницу (с кнопками)
+    proxies_per_page = 5
+    total_pages = (len(proxies) + proxies_per_page - 1) // proxies_per_page
+    start_idx = (page - 1) * proxies_per_page
+    end_idx = start_idx + proxies_per_page
+    page_proxies = proxies[start_idx:end_idx]
+
     # Создаем список прокси с кнопками для каждого
-    message = "📋 *Список прокси*\n\n"
+    message = f"📋 *Список прокси* (страница {page}/{total_pages})\n\n"
     keyboard = []
 
-    for proxy in proxies:
+    for proxy in page_proxies:
         status = "✅ Активен" if proxy.is_active else "❌ Неактивен"
-        auth_info = " (с авторизацией)" if proxy.username else ""
+        auth_info = " 🔐" if proxy.username else ""
 
         message += f"*ID {proxy.id}*: {proxy.host}:{proxy.port} - {proxy.protocol.upper()}{auth_info} - {status}\n"
 
@@ -160,6 +175,20 @@ def list_proxies_handler(update: Update, context: CallbackContext):
             InlineKeyboardButton(f"🔄 Проверить #{proxy.id}", callback_data=f'check_proxy_{proxy.id}'),
             InlineKeyboardButton(f"❌ Удалить #{proxy.id}", callback_data=f'delete_proxy_{proxy.id}')
         ])
+
+    # Кнопки навигации по страницам
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Пред", callback_data=f"list_proxies_page_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("След ➡️", callback_data=f"list_proxies_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+
+    # Кнопка удаления всех прокси (только если есть прокси)
+    if len(proxies) > 0:
+        keyboard.append([InlineKeyboardButton("🗑️ Удалить все прокси", callback_data='delete_all_proxies')])
 
     keyboard.append([InlineKeyboardButton("🔙 К меню прокси", callback_data='menu_proxy')])
     keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')])
@@ -193,14 +222,8 @@ def check_proxy_handler(update: Update, context: CallbackContext):
         f"🔄 Проверка прокси {proxy.host}:{proxy.port}... Пожалуйста, подождите."
     )
 
-    # Формируем URL прокси
-    proxy_url = f"{proxy.protocol}://"
-    if proxy.username and proxy.password:
-        proxy_url += f"{proxy.username}:{proxy.password}@"
-    proxy_url += f"{proxy.host}:{proxy.port}"
-
-    # Проверяем прокси
-    _, is_working, error = check_proxy(proxy.id, proxy_url)
+    # Проверяем прокси (передаем объект proxy напрямую)
+    _, is_working, error = check_proxy(proxy)
 
     # Обновляем статус прокси в базе данных
     update_proxy(proxy_id, is_active=is_working)
@@ -472,6 +495,91 @@ def process_proxy_file(update: Update, context: CallbackContext):
     # Очищаем данные пользователя
     context.user_data.clear()
 
+def delete_all_proxies_handler(update: Update, context: CallbackContext):
+    """Показывает подтверждение удаления всех прокси"""
+    query = update.callback_query
+    query.answer()
+
+    proxies = get_proxies()
+    proxies_count = len(proxies)
+
+    keyboard = [
+        [InlineKeyboardButton("⚠️ Да, удалить все", callback_data='confirm_delete_all_proxies')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='list_proxies')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    query.edit_message_text(
+        f"⚠️ *Подтверждение удаления*\n\n"
+        f"Вы действительно хотите удалить все {proxies_count} прокси?\n\n"
+        f"❗ *Это действие нельзя отменить!*",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    return ConversationHandler.END
+
+def confirm_delete_all_proxies_handler(update: Update, context: CallbackContext):
+    """Удаляет все прокси после подтверждения"""
+    query = update.callback_query
+    query.answer()
+
+    query.edit_message_text(
+        "🗑️ Удаление всех прокси... Пожалуйста, подождите."
+    )
+
+    try:
+        # Получаем все прокси
+        proxies = get_proxies()
+        deleted_count = 0
+
+        # Удаляем каждый прокси
+        for proxy in proxies:
+            success = delete_proxy(proxy.id)
+            if success:
+                deleted_count += 1
+
+        keyboard = [
+            [InlineKeyboardButton("🔙 К меню прокси", callback_data='menu_proxy')],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if deleted_count > 0:
+            query.edit_message_text(
+                f"✅ *Успешно удалено {deleted_count} прокси*\n\n"
+                f"Все прокси были удалены из системы.",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            query.edit_message_text(
+                f"⚠️ *Не удалось удалить прокси*\n\n"
+                f"Возможно, прокси уже были удалены или произошла ошибка.",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка при удалении всех прокси: {e}")
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 К списку прокси", callback_data='list_proxies')],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data='main_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        query.edit_message_text(
+            f"❌ *Ошибка при удалении прокси*\n\n"
+            f"Произошла ошибка: {str(e)}",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # Очищаем данные пользователя и завершаем состояние
+    context.user_data.clear()
+    return ConversationHandler.END
+
 def main_menu_handler(update: Update, context: CallbackContext):
     """Возвращает пользователя в главное меню"""
     query = update.callback_query
@@ -481,10 +589,10 @@ def main_menu_handler(update: Update, context: CallbackContext):
     context.user_data.clear()
 
     # Показываем главное меню
-    from telegram_bot.keyboards import get_main_menu_inline_keyboard
+    from telegram_bot.keyboards import get_main_menu_keyboard
     query.edit_message_text(
         "🏠 Главное меню\nВыберите действие:",
-        reply_markup=get_main_menu_inline_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
     return ConversationHandler.END
@@ -505,9 +613,12 @@ def get_proxy_handlers():
         CallbackQueryHandler(proxy_menu, pattern='^menu_proxy$'),
         add_proxy_conv_handler,
         CallbackQueryHandler(list_proxies_handler, pattern='^list_proxies$'),
-        CallbackQueryHandler(check_proxy_handler, pattern='^check_proxy_\d+$'),
-        CallbackQueryHandler(delete_proxy_handler, pattern='^delete_proxy_\d+$'),
-        CallbackQueryHandler(confirm_delete_proxy_handler, pattern='^confirm_delete_proxy_\d+$'),
+        CallbackQueryHandler(list_proxies_handler, pattern=r'^list_proxies_page_\d+$'),
+        CallbackQueryHandler(check_proxy_handler, pattern=r'^check_proxy_\d+$'),
+        CallbackQueryHandler(delete_proxy_handler, pattern=r'^delete_proxy_\d+$'),
+        CallbackQueryHandler(confirm_delete_proxy_handler, pattern=r'^confirm_delete_proxy_\d+$'),
+        CallbackQueryHandler(delete_all_proxies_handler, pattern='^delete_all_proxies$'),
+        CallbackQueryHandler(confirm_delete_all_proxies_handler, pattern='^confirm_delete_all_proxies$'),
         CallbackQueryHandler(check_all_proxies_handler, pattern='^check_proxies$'),
         CallbackQueryHandler(distribute_proxies_handler, pattern='^distribute_proxies$'),
         CallbackQueryHandler(import_proxies_handler, pattern='^import_proxies$'),

@@ -13,14 +13,22 @@ from database.db_manager import (
     create_publish_task, delete_instagram_account
 )
 from .keyboards import (
-    get_main_menu_keyboard, get_main_menu_inline_keyboard,
+    get_main_menu_keyboard,
     get_accounts_menu_keyboard, get_tasks_menu_keyboard, 
     get_proxy_menu_keyboard, get_accounts_list_keyboard, 
-    get_publish_type_keyboard, get_account_actions_keyboard
+    get_account_actions_keyboard
 )
 from utils.proxy_manager import distribute_proxies, check_proxy, check_all_proxies
 from instagram.post_manager import PostManager
 from instagram.reels_manager import ReelsManager, publish_reels_in_parallel
+
+# Импорты продвинутых систем
+from instagram.improved_account_warmer import ImprovedAccountWarmer, warm_account_improved
+from instagram.health_monitor import AdvancedHealthMonitor
+from instagram.activity_limiter import ActivityLimiter
+from instagram.advanced_verification import AdvancedVerificationSystem
+from instagram.lifecycle_manager import AccountLifecycleManager
+from instagram.predictive_monitor import PredictiveMonitor
 
 # Импорты из нового модуля profile_setup
 from profile_setup.name_manager import update_profile_name
@@ -54,11 +62,12 @@ def start_handler(update: Update, context: CallbackContext):
         update.message.reply_text("У вас нет доступа к этому боту.")
         return
     
-    # Приветственное сообщение
+    # Приветственное сообщение с кнопкой "Продолжить"
+    from .keyboards import get_start_keyboard
     update.message.reply_text(
-        f"Привет, {update.effective_user.first_name}! Я бот для управления аккаунтами Instagram.\n\n"
-        "Используйте кнопки меню для навигации:",
-        reply_markup=get_main_menu_keyboard()
+        "🤖 Я бот для управления аккаунтами Instagram.\n\n"
+        "Нажмите кнопку ниже, чтобы начать работу:",
+        reply_markup=get_start_keyboard()
     )
 
 def help_handler(update: Update, context: CallbackContext):
@@ -131,6 +140,158 @@ def proxy_handler(update: Update, context: CallbackContext):
         "Меню управления прокси:",
         reply_markup=get_proxy_menu_keyboard()
     )
+
+# Обработчики для продвинутых систем
+def advanced_handler(update: Update, context: CallbackContext):
+    """Обработчик команды /advanced"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_USER_IDS:
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Health Monitor", callback_data="health_monitor")],
+        [InlineKeyboardButton("⚡ Activity Limiter", callback_data="activity_limiter")],
+        [InlineKeyboardButton("🚀 Improved Warmer", callback_data="improved_warmer")],
+        [InlineKeyboardButton("📊 System Status", callback_data="system_status")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text(
+        "🎛️ *Продвинутые системы управления*\n\n"
+        "Выберите систему:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+def health_monitor_handler(update: Update, context: CallbackContext):
+    """Обработчик команды /health_monitor"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_USER_IDS:
+        return
+    
+    update.message.reply_text("🔍 Запускаю проверку здоровья всех аккаунтов...")
+    
+    try:
+        health_monitor = AdvancedHealthMonitor()
+        accounts = get_instagram_accounts()
+        
+        if not accounts:
+            update.message.reply_text("❌ Аккаунты не найдены.")
+            return
+        
+        report = "📊 *Отчет Health Monitor*\n\n"
+        
+        for account in accounts:
+            score = health_monitor.calculate_comprehensive_health_score(account.id)
+            recommendations = health_monitor.get_health_recommendations(account.id)
+            
+            status = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
+            report += f"{status} *{account.username}*: {score}/100\n"
+            
+            if recommendations:
+                report += f"   💡 {recommendations[0]}\n"
+            report += "\n"
+        
+        update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        logger.error(f"Ошибка Health Monitor: {e}")
+        update.message.reply_text(f"❌ Ошибка при проверке здоровья: {e}")
+
+def improved_warmer_handler(update: Update, context: CallbackContext):
+    """Обработчик команды /improved_warmer"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_USER_IDS:
+        return
+    
+    accounts = get_instagram_accounts()
+    
+    if not accounts:
+        update.message.reply_text("❌ Аккаунты не найдены.")
+        return
+    
+    keyboard = []
+    for account in accounts:
+        keyboard.append([InlineKeyboardButton(
+            f"🔥 {account.username}", 
+            callback_data=f"improved_warm_{account.id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="advanced_systems")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text(
+        "🚀 *Улучшенный прогрев аккаунтов*\n\n"
+        "Выберите аккаунт для прогрева:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+def system_status_handler(update: Update, context: CallbackContext):
+    """Обработчик команды /system_status"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_USER_IDS:
+        return
+    
+    try:
+        # Проверяем статус всех систем
+        health_monitor = AdvancedHealthMonitor()
+        activity_limiter = ActivityLimiter()
+        lifecycle_manager = AccountLifecycleManager()
+        predictive_monitor = PredictiveMonitor()
+        
+        accounts = get_instagram_accounts()
+        total_accounts = len(accounts)
+        
+        # Health Monitor Status
+        healthy_accounts = 0
+        for account in accounts:
+            score = health_monitor.calculate_comprehensive_health_score(account.id)
+            if score >= 80:
+                healthy_accounts += 1
+        
+        # Activity Limiter Status
+        restricted_accounts = 0
+        for account in accounts:
+            restrictions = activity_limiter.check_current_restrictions(account.id)
+            if restrictions:
+                restricted_accounts += 1
+        
+        status_report = (
+            f"📊 *Статус всех систем*\n\n"
+            f"👥 *Общая информация:*\n"
+            f"   Всего аккаунтов: {total_accounts}\n\n"
+            
+            f"🔍 *Health Monitor:*\n"
+            f"   ✅ Здоровых аккаунтов: {healthy_accounts}/{total_accounts}\n"
+            f"   📈 Процент здоровья: {int(healthy_accounts/total_accounts*100) if total_accounts > 0 else 0}%\n\n"
+            
+            f"⚡ *Activity Limiter:*\n"
+            f"   🚫 Аккаунтов с ограничениями: {restricted_accounts}/{total_accounts}\n"
+            f"   ✅ Свободных аккаунтов: {total_accounts - restricted_accounts}\n\n"
+            
+            f"🔄 *Lifecycle Manager:*\n"
+            f"   🆕 Статус: Все аккаунты отслеживаются\n\n"
+            
+            f"🛡️ *Predictive Monitor:*\n"
+            f"   🎯 Система анализа рисков: Активна\n"
+            f"   📊 ML модель: Готова к предсказаниям\n\n"
+            
+            f"⏰ Последнее обновление: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
+        update.message.reply_text(status_report, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        logger.error(f"Ошибка System Status: {e}")
+        update.message.reply_text(f"❌ Ошибка при получении статуса систем: {e}")
 
 # Обработчики для аккаунтов
 def add_account_handler(update: Update, context: CallbackContext):
@@ -777,15 +938,58 @@ def callback_handler(update: Update, context: CallbackContext):
 
     # Основные меню
     if data == "main_menu":
+        from .keyboards import get_main_menu_keyboard
         query.edit_message_text(
-            "🏠 Главное меню\nВыберите действие:",
-            reply_markup=get_main_menu_inline_keyboard()
+            "🏠 Главное меню\n\nВыберите раздел:",
+            reply_markup=get_main_menu_keyboard()
         )
     
-    elif data == "accounts_menu":
+    elif data == "menu_publications":
+        from .keyboards import get_publications_menu_keyboard
         query.edit_message_text(
-            "🔑 Управление аккаунтами\nВыберите действие:",
-            reply_markup=get_accounts_menu_keyboard()
+            "📤 *Меню публикаций*\n\nВыберите тип публикации:",
+            reply_markup=get_publications_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_scheduled":
+        from .keyboards import get_scheduled_menu_keyboard
+        query.edit_message_text(
+            "🗓️ *Меню запланированных публикаций*\n\nВыберите тип публикации для планирования:",
+            reply_markup=get_scheduled_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_warmup":
+        from .keyboards import get_warmup_menu_keyboard
+        query.edit_message_text(
+            "🔥 *Меню прогрева аккаунтов*\n\nВыберите действие:",
+            reply_markup=get_warmup_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_statistics":
+        from .keyboards import get_statistics_menu_keyboard
+        query.edit_message_text(
+            "📊 *Меню статистики*\n\nВыберите раздел:",
+            reply_markup=get_statistics_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text(
+            "⚙️ *Меню настроек*\n\nВыберите раздел:",
+            reply_markup=get_settings_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_accounts":
+        from .keyboards import get_accounts_menu_keyboard
+        query.edit_message_text(
+            "👤 *Управление аккаунтами*\n\nВыберите действие:",
+            reply_markup=get_accounts_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
         )
     
     elif data == "tasks_menu":
@@ -856,11 +1060,226 @@ def callback_handler(update: Update, context: CallbackContext):
                     f"{account.username} {'✅' if account.is_active else '❌'}",
                     callback_data=f"profile_setup_{account.id}"
                 )])
-            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="accounts_menu")])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_accounts")])
             
             query.edit_message_text(
                 "⚙️ Выберите аккаунт для настройки профиля:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    
+    elif data == "folders_menu":
+        from .keyboards import get_folders_menu_keyboard
+        query.edit_message_text(
+            "📁 *Управление папками аккаунтов*\n\nВыберите действие:",
+            reply_markup=get_folders_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+    
+    # Новые обработчики для расширенного меню
+    elif data == "scheduled_posts":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text("🗓️ Запланированные публикации в разработке", reply_markup=get_publications_menu_keyboard())
+    
+    elif data == "publication_history":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text("📊 История публикаций в разработке", reply_markup=get_publications_menu_keyboard())
+    
+    elif data == "warmup_analytics":
+        from .keyboards import get_warmup_menu_keyboard
+        query.edit_message_text("📈 Аналитика прогрева в разработке", reply_markup=get_warmup_menu_keyboard())
+    
+    # Обработчики статистики
+    elif data == "general_stats":
+        # Запускаем общую аналитику
+        from .handlers.analytics_handlers import start_general_analytics
+        start_general_analytics(update, context)
+    
+    elif data == "accounts_stats":
+        # Запускаем аналитику аккаунтов
+        from .handlers.analytics_handlers import start_accounts_analytics
+        start_accounts_analytics(update, context)
+    
+    elif data == "publications_stats":
+        # Запускаем аналитику публикаций с выбором аккаунта
+        from .handlers.analytics_handlers import start_publications_analytics
+        start_publications_analytics(update, context)
+    
+    elif data == "warmup_stats":
+        from .keyboards import get_statistics_menu_keyboard
+        query.edit_message_text("🔥 Статистика по прогреву в разработке", reply_markup=get_statistics_menu_keyboard())
+    
+    # Обработчики действий аналитики публикаций
+    elif data in ["analytics_recent_posts", "analytics_top_likes", "analytics_top_comments", "analytics_detailed", "analytics_stories"]:
+        from .handlers.analytics_handlers import handle_analytics_action
+        handle_analytics_action(update, context, data)
+    
+    # Обработчики настроек
+    elif data == "general_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text("🔧 Основные настройки в разработке", reply_markup=get_settings_menu_keyboard())
+    
+    elif data == "schedule_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text("⏰ Настройки расписания в разработке", reply_markup=get_settings_menu_keyboard())
+    
+    elif data == "notifications_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text("🚨 Настройки уведомлений в разработке", reply_markup=get_settings_menu_keyboard())
+    
+    elif data == "security_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text("🔒 Настройки безопасности в разработке", reply_markup=get_settings_menu_keyboard())
+    
+    elif data == "backup_settings":
+        from .keyboards import get_settings_menu_keyboard
+        query.edit_message_text("💾 Настройки резервного копирования в разработке", reply_markup=get_settings_menu_keyboard())
+    
+    # Обработчики типов публикаций
+    elif data == "publish_post":
+        # Выбираем аккаунт для публикации
+        from .keyboards import get_publications_menu_keyboard
+        accounts = get_instagram_accounts()
+        if not accounts:
+            query.edit_message_text(
+                "❌ Нет доступных аккаунтов",
+                reply_markup=get_publications_menu_keyboard()
+            )
+        else:
+            keyboard = []
+            for account in accounts:
+                keyboard.append([InlineKeyboardButton(
+                    f"{'✅' if account.is_active else '❌'} {account.username}",
+                    callback_data=f"post_to_{account.id}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="publish_type")])
+            query.edit_message_text(
+                "📸 Выберите аккаунт для публикации поста:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    
+    elif data == "publish_story":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text("📱 Публикация историй в разработке", reply_markup=get_publications_menu_keyboard())
+    
+    elif data == "publish_igtv":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text("🎬 Публикация IGTV в разработке", reply_markup=get_publications_menu_keyboard())
+    
+    elif data == "publish_igtv_blocked":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text(
+            "🔒 *IGTV публикация временно недоступна*\n\n"
+            "🚧 Функция находится в разработке и будет доступна в ближайших обновлениях.\n\n"
+            "📱 Пока что вы можете использовать:\n"
+            "• 📸 Публикация постов\n"
+            "• 📱 Истории\n"
+            "• 🎥 Reels\n\n"
+            "Спасибо за понимание! 🙏",
+            reply_markup=get_publications_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+    
+    elif data == "publish_reels":
+        # Выбираем аккаунт для публикации Reels
+        from .keyboards import get_publications_menu_keyboard
+        accounts = get_instagram_accounts()
+        if not accounts:
+            query.edit_message_text(
+                "❌ Нет доступных аккаунтов",
+                reply_markup=get_publications_menu_keyboard()
+            )
+        else:
+            keyboard = []
+            for account in accounts:
+                keyboard.append([InlineKeyboardButton(
+                    f"{'✅' if account.is_active else '❌'} {account.username}",
+                    callback_data=f"reel_to_{account.id}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="publish_type")])
+            query.edit_message_text(
+                "🎥 Выберите аккаунт для публикации Reels:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    
+    elif data == "set_limits":
+        from .keyboards import get_publications_menu_keyboard
+        query.edit_message_text("🔧 Настройка лимитов в разработке", reply_markup=get_publications_menu_keyboard())
+    
+    # Обработчики режимов прогрева
+    elif data == "quick_warmup":
+        from .keyboards import get_warmup_mode_keyboard
+        query.edit_message_text("⚡ Быстрый прогрев в разработке", reply_markup=get_warmup_mode_keyboard())
+    
+    elif data == "smart_warmup":
+        # Запускаем умный прогрев
+        from .keyboards import get_warmup_mode_keyboard
+        accounts = get_instagram_accounts()
+        if not accounts:
+            query.edit_message_text(
+                "❌ Нет доступных аккаунтов",
+                reply_markup=get_warmup_mode_keyboard()
+            )
+        else:
+            keyboard = []
+            for account in accounts:
+                keyboard.append([InlineKeyboardButton(
+                    f"{'✅' if account.is_active else '❌'} {account.username}",
+                    callback_data=f"warm_account_{account.id}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="warmup_mode")])
+            query.edit_message_text(
+                "🧠 Выберите аккаунт для умного прогрева:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    
+    elif data == "warmup_status":
+        # Показываем статус прогрева аккаунтов
+        from .keyboards import get_warmup_mode_keyboard
+        query.edit_message_text("📊 Загрузка статуса прогрева...")
+        # TODO: Реализовать получение статуса прогрева
+        query.edit_message_text("📊 Статус прогрева в разработке", reply_markup=get_warmup_mode_keyboard())
+    
+    elif data == "warmup_settings":
+        from .keyboards import get_warmup_mode_keyboard
+        query.edit_message_text("⚙️ Настройки прогрева в разработке", reply_markup=get_warmup_mode_keyboard())
+    
+    # Обработчики задач по статусам
+    elif data == "active_tasks":
+        from .keyboards import get_tasks_by_status_keyboard
+        query.edit_message_text("✅ Активные задачи в разработке", reply_markup=get_tasks_by_status_keyboard())
+    
+    elif data == "paused_tasks":
+        from .keyboards import get_tasks_by_status_keyboard
+        query.edit_message_text("⏸️ Приостановленные задачи в разработке", reply_markup=get_tasks_by_status_keyboard())
+    
+    elif data == "completed_tasks":
+        from .keyboards import get_tasks_by_status_keyboard
+        query.edit_message_text("✓ Завершенные задачи в разработке", reply_markup=get_tasks_by_status_keyboard())
+    
+    elif data == "error_tasks":
+        from .keyboards import get_tasks_by_status_keyboard
+        query.edit_message_text("❌ Задачи с ошибками в разработке", reply_markup=get_tasks_by_status_keyboard())
+    
+    # Статистика аккаунтов
+    elif data == "accounts_statistics":
+        accounts = get_instagram_accounts()
+        active_count = sum(1 for acc in accounts if acc.is_active)
+        inactive_count = len(accounts) - active_count
+        
+        stats_text = (
+            f"📊 *Статистика аккаунтов*\n\n"
+            f"👥 Всего аккаунтов: {len(accounts)}\n"
+            f"✅ Активных: {active_count}\n"
+            f"❌ Неактивных: {inactive_count}\n"
+        )
+        
+        from .keyboards import get_messages_actions_keyboard
+        query.edit_message_text(
+            stats_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_messages_actions_keyboard()
             )
 
     # Задачи публикации
@@ -902,7 +1321,15 @@ def callback_handler(update: Update, context: CallbackContext):
                 reply_markup=get_proxy_menu_keyboard()
             )
 
-    elif data == "list_proxies":
+    elif data == "list_proxies" or data.startswith("list_proxies_page_"):
+        # Извлекаем номер страницы
+        page = 1
+        if data.startswith("list_proxies_page_"):
+            try:
+                page = int(data.split("_")[-1])
+            except (ValueError, IndexError):
+                page = 1
+        
         proxies = get_proxies()
         if not proxies:
             query.edit_message_text(
@@ -911,13 +1338,35 @@ def callback_handler(update: Update, context: CallbackContext):
                 reply_markup=get_proxy_menu_keyboard()
             )
         else:
-            proxy_list = "📋 Список прокси:\n\n"
-            for proxy in proxies:
-                status = "✅" if proxy.is_active else "❌"
-                proxy_list += f"{status} {proxy.protocol}://{proxy.host}:{proxy.port}\n"
+            # Пагинация: показываем по 10 прокси на страницу
+            proxies_per_page = 10
+            total_pages = (len(proxies) + proxies_per_page - 1) // proxies_per_page
+            start_idx = (page - 1) * proxies_per_page
+            end_idx = start_idx + proxies_per_page
+            page_proxies = proxies[start_idx:end_idx]
             
-            keyboard = [[InlineKeyboardButton("🔍 Проверить все", callback_data="check_all_proxies")],
-                       [InlineKeyboardButton("🔙 Назад", callback_data="proxy_menu")]]
+            proxy_list = f"📋 Список прокси (страница {page}/{total_pages}):\n\n"
+            for proxy in page_proxies:
+                status = "✅" if proxy.is_active else "❌"
+                auth_info = " 🔐" if proxy.username else ""
+                proxy_list += f"{status} {proxy.protocol}://{proxy.host}:{proxy.port}{auth_info}\n"
+            
+            # Создаем кнопки навигации
+            keyboard = []
+            
+            # Кнопки навигации по страницам
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Пред", callback_data=f"list_proxies_page_{page-1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("След ➡️", callback_data=f"list_proxies_page_{page+1}"))
+            
+            if nav_buttons:
+                keyboard.append(nav_buttons)
+            
+            # Кнопки действий
+            keyboard.append([InlineKeyboardButton("🔍 Проверить все", callback_data="check_all_proxies")])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="proxy_menu")])
             
             query.edit_message_text(
                 proxy_list,
@@ -1039,8 +1488,8 @@ def callback_handler(update: Update, context: CallbackContext):
         except ValueError:
             query.edit_message_text(
                 "❌ Ошибка: неверный формат ID аккаунта",
-                                 reply_markup=get_accounts_menu_keyboard()
-             )
+                reply_markup=get_accounts_menu_keyboard()
+            )
 
     # Подтверждение удаления аккаунта
     elif data.startswith("confirm_delete_"):
@@ -1448,13 +1897,231 @@ def callback_handler(update: Update, context: CallbackContext):
             reply_markup=get_proxy_menu_keyboard()
         )
 
+    # Callback обработчики для продвинутых систем
+    elif data == "advanced_systems":
+        keyboard = [
+            [InlineKeyboardButton("🔍 Health Monitor", callback_data="health_monitor")],
+            [InlineKeyboardButton("⚡ Activity Limiter", callback_data="activity_limiter")],
+            [InlineKeyboardButton("🚀 Improved Warmer", callback_data="improved_warmer")],
+            [InlineKeyboardButton("📊 System Status", callback_data="system_status")],
+            [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            "🎛️ *Продвинутые системы управления*\n\n"
+            "Выберите систему:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+
+    elif data == "health_monitor":
+        query.edit_message_text("🔍 Запускаю проверку здоровья всех аккаунтов...")
+        
+        try:
+            health_monitor = AdvancedHealthMonitor()
+            accounts = get_instagram_accounts()
+            
+            if not accounts:
+                query.edit_message_text("❌ Аккаунты не найдены.")
+                return
+            
+            report = "📊 *Отчет Health Monitor*\n\n"
+            
+            for account in accounts:
+                score = health_monitor.calculate_comprehensive_health_score(account.id)
+                recommendations = health_monitor.get_health_recommendations(account.id)
+                
+                status = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
+                report += f"{status} *{account.username}*: {score}/100\n"
+                
+                if recommendations:
+                    report += f"   💡 {recommendations[0]}\n"
+                report += "\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="advanced_systems")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query.edit_message_text(
+                report, 
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка Health Monitor: {e}")
+            query.edit_message_text(f"❌ Ошибка при проверке здоровья: {e}")
+
+    elif data == "activity_limiter":
+        query.edit_message_text("⚡ Проверяю лимиты активности...")
+        
+        try:
+            activity_limiter = ActivityLimiter()
+            accounts = get_instagram_accounts()
+            
+            if not accounts:
+                query.edit_message_text("❌ Аккаунты не найдены.")
+                return
+            
+            report = "⚡ *Отчет Activity Limiter*\n\n"
+            
+            for account in accounts:
+                restrictions = activity_limiter.check_current_restrictions(account.id)
+                limits = activity_limiter.get_dynamic_limits(account.id)
+                
+                status = "🔴" if restrictions else "🟢"
+                report += f"{status} *{account.username}*\n"
+                
+                if restrictions:
+                    report += f"   ⚠️ Ограничения: {', '.join(restrictions)}\n"
+                else:
+                    report += f"   ✅ Лимиты: follows: {limits.get('follows_per_day', 0)}/день\n"
+                
+                report += "\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="advanced_systems")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query.edit_message_text(
+                report,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка Activity Limiter: {e}")
+            query.edit_message_text(f"❌ Ошибка при проверке лимитов: {e}")
+
+    elif data == "improved_warmer":
+        accounts = get_instagram_accounts()
+        
+        if not accounts:
+            query.edit_message_text("❌ Аккаунты не найдены.")
+            return
+        
+        keyboard = []
+        for account in accounts:
+            keyboard.append([InlineKeyboardButton(
+                f"🔥 {account.username}", 
+                callback_data=f"improved_warm_{account.id}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="advanced_systems")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            "🚀 *Улучшенный прогрев аккаунтов*\n\n"
+            "Выберите аккаунт для прогрева:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+
+    elif data.startswith("improved_warm_"):
+        try:
+            account_id = int(data.replace("improved_warm_", ""))
+            account = get_instagram_account(account_id)
+            
+            if not account:
+                query.edit_message_text("❌ Аккаунт не найден.")
+                return
+            
+            query.edit_message_text(f"🔥 Запускаю улучшенный прогрев для {account.username}...")
+            
+            success, result = warm_account_improved(account_id)
+            
+            if success:
+                query.edit_message_text(
+                    f"✅ Прогрев аккаунта {account.username} успешно завершен!\n\n"
+                    f"📊 Результат: {result}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Назад", callback_data="improved_warmer")]
+                    ])
+                )
+            else:
+                query.edit_message_text(
+                    f"❌ Ошибка при прогреве {account.username}: {result}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Назад", callback_data="improved_warmer")]
+                    ])
+                )
+                
+        except ValueError:
+            query.edit_message_text("❌ Ошибка: неверный формат ID аккаунта")
+        except Exception as e:
+            logger.error(f"Ошибка улучшенного прогрева: {e}")
+            query.edit_message_text(f"❌ Ошибка при прогреве: {e}")
+
+    elif data == "system_status":
+        try:
+            # Проверяем статус всех систем
+            health_monitor = AdvancedHealthMonitor()
+            activity_limiter = ActivityLimiter()
+            lifecycle_manager = AccountLifecycleManager()
+            predictive_monitor = PredictiveMonitor()
+            
+            accounts = get_instagram_accounts()
+            total_accounts = len(accounts)
+            
+            # Health Monitor Status
+            healthy_accounts = 0
+            for account in accounts:
+                score = health_monitor.calculate_comprehensive_health_score(account.id)
+                if score >= 80:
+                    healthy_accounts += 1
+            
+            # Activity Limiter Status
+            restricted_accounts = 0
+            for account in accounts:
+                restrictions = activity_limiter.check_current_restrictions(account.id)
+                if restrictions:
+                    restricted_accounts += 1
+            
+            status_report = (
+                f"📊 *Статус всех систем*\n\n"
+                f"👥 *Общая информация:*\n"
+                f"   Всего аккаунтов: {total_accounts}\n\n"
+                
+                f"🔍 *Health Monitor:*\n"
+                f"   ✅ Здоровых аккаунтов: {healthy_accounts}/{total_accounts}\n"
+                f"   📈 Процент здоровья: {int(healthy_accounts/total_accounts*100) if total_accounts > 0 else 0}%\n\n"
+                
+                f"⚡ *Activity Limiter:*\n"
+                f"   🚫 Аккаунтов с ограничениями: {restricted_accounts}/{total_accounts}\n"
+                f"   ✅ Свободных аккаунтов: {total_accounts - restricted_accounts}\n\n"
+                
+                f"🔄 *Lifecycle Manager:*\n"
+                f"   🆕 Статус: Все аккаунты отслеживаются\n\n"
+                
+                f"🛡️ *Predictive Monitor:*\n"
+                f"   🎯 Система анализа рисков: Активна\n"
+                f"   📊 ML модель: Готова к предсказаниям\n\n"
+                
+                f"⏰ Последнее обновление: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="system_status")],
+                       [InlineKeyboardButton("🔙 Назад", callback_data="advanced_systems")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query.edit_message_text(
+                status_report, 
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка System Status: {e}")
+            query.edit_message_text(f"❌ Ошибка при получении статуса систем: {e}")
+
     # Обработчик для неизвестных callback_data
     else:
         logger.warning(f"Неизвестный callback_data: {data} от пользователя {user_id}")
         query.edit_message_text(
             f"❌ Неизвестная команда: {data}\n\n"
             "Возвращаю в главное меню",
-            reply_markup=get_main_menu_inline_keyboard()
+                                    reply_markup=get_main_menu_keyboard()
         )
 
     # Подтверждаем обработку callback

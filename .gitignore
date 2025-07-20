@@ -21,55 +21,81 @@ wheels/
 *.egg
 MANIFEST
 
-# Virtual Environment
+# Virtual environments
 venv/
-env/
 ENV/
+env/
+web_env/
+web_env_new/
+utils/fresh_env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+data/logs/
+
+# Sensitive data - ВАЖНО!
+config.py
+data/accounts/*/session.json
+data/user_agents.json
+devices/*.json
+working_accounts/
+email_logs/
+*.db
+instagram.db
+
+# Test files
+test_content/
+media/
+nul
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Next.js
+.next/
+out/
+instagram-automation-dashboard/.next/
+instagram-automation-dashboard/out/
 
 # Environment variables
 .env
 .env.local
+.env.production
+.env.development
 
-# Database
-*.db
-*.sqlite
-*.sqlite3
+# Backup files
+*.bak
+instagram_api/publisher.py.bak
+backup_*.py
+quick_backup.py
 
-# Logs
-*.log
-data/logs/
-logs/
-
-# Media files (optional - you may want to include sample media)
-data/media/
-media/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Cache
+.pytest_cache/
+.cache/
 
 # macOS
-.DS_Store
+.AppleDouble
+.LSOverride
 
 # Windows
-Thumbs.db
-ehthumbs.db
+Desktop.ini
 
-# Temporary files
-*.tmp
-*.temp
-
-# Session files
-sessions/
-*.session
-
-# Config with sensitive data
-config_local.py
-secrets.py
-
-# Instagram cookies and sessions
-cookies/
-instagram_sessions/ 
+# Reddit plans (временно, пока не готовы делиться)
+REDDIT_OF_*.md 

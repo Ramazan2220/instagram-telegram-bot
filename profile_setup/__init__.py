@@ -8,7 +8,7 @@ EDIT_NAME, EDIT_USERNAME, EDIT_BIO, EDIT_LINKS, ADD_PHOTO, ADD_POST = range(6)
 from .name_manager import edit_profile_name, save_profile_name
 from .username_manager import edit_profile_username, save_profile_username
 from .bio_manager import edit_profile_bio, save_profile_bio, delete_bio
-from .links_manager import edit_profile_links, save_profile_links
+from .links_manager import edit_profile_links, save_profile_links, convert_to_business_account
 from .avatar_manager import add_profile_photo, save_profile_photo, delete_profile_photo
 from .post_manager import add_post, save_post
 from .cleanup_manager import delete_all_posts
@@ -50,10 +50,20 @@ def get_profile_handlers():
         CallbackQueryHandler(profile_setup_menu, pattern='^profile_setup$'),
         CallbackQueryHandler(profile_account_menu, pattern='^profile_account_'),
         CallbackQueryHandler(delete_profile_photo, pattern='^profile_delete_photo$'),
-        CallbackQueryHandler(add_profile_photo, pattern='^add_profile_photo_\d+$'),  
+        CallbackQueryHandler(add_profile_photo, pattern=r'^add_profile_photo_\d+$'),  
         CallbackQueryHandler(delete_all_posts, pattern='^profile_delete_posts$'),
         CallbackQueryHandler(delete_bio, pattern='^profile_delete_bio$'),
+        # Добавляем обработчик для массового добавления фото
+        CallbackQueryHandler(lambda u, c: c.bot.send_message(u.effective_chat.id, "🔧 Функция массового добавления фото находится в разработке"), pattern='^bulk_add_photo$'),
         profile_conv_handler,
     ]
+
+    return handlers
+
+    return handlers
+
+    return handlers
+
+    return handlers
 
     return handlers

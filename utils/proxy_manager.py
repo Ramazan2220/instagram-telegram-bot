@@ -11,37 +11,51 @@ from config import MAX_WORKERS
 
 logger = logging.getLogger(__name__)
 
-def check_proxy(proxy_id, proxy_url):
+def check_proxy(proxy_object):
     """
     Проверка работоспособности прокси
 
     Args:
-        proxy_id: ID прокси в базе данных (может быть None для новых прокси)
-        proxy_url: URL прокси в формате protocol://[username:password@]host:port
+        proxy_object: Объект прокси из базы данных
 
     Returns:
         tuple: (proxy_id, is_working, error_message)
     """
     try:
+        # Формируем URL прокси с встроенными credentials (как в curl)
+        if proxy_object.username and proxy_object.password:
+            proxy_url = f"{proxy_object.protocol}://{proxy_object.username}:{proxy_object.password}@{proxy_object.host}:{proxy_object.port}"
+        else:
+            proxy_url = f"{proxy_object.protocol}://{proxy_object.host}:{proxy_object.port}"
+        
         # Настраиваем прокси для запроса
         proxies = {
             'http': proxy_url,
             'https': proxy_url
         }
 
-        # Делаем запрос к Google с таймаутом 10 секунд
-        response = requests.get('https://www.google.com', proxies=proxies, timeout=10)
+        # Делаем запрос к httpbin.org с таймаутом 20 секунд
+        response = requests.get('http://httpbin.org/ip', proxies=proxies, timeout=20)
 
         # Если статус 200, прокси работает
         if response.status_code == 200:
-            logger.info(f"Прокси {proxy_url} работает")
-            return proxy_id, True, None
+            logger.info(f"✅ Прокси {proxy_object.host}:{proxy_object.port} (user: {proxy_object.username}) работает")
+            return proxy_object.id, True, None
         else:
-            logger.warning(f"Прокси {proxy_url} вернул статус {response.status_code}")
-            return proxy_id, False, f"Статус {response.status_code}"
+            logger.warning(f"❌ Прокси {proxy_object.host}:{proxy_object.port} вернул статус {response.status_code}")
+            return proxy_object.id, False, f"Статус {response.status_code}"
+    except requests.exceptions.ConnectTimeout:
+        error_msg = "Таймаут подключения"
+        logger.warning(f"❌ Прокси {proxy_object.host}:{proxy_object.port}: {error_msg}")
+        return proxy_object.id, False, error_msg
+    except requests.exceptions.ProxyError as e:
+        error_msg = f"Ошибка прокси: {str(e)}"
+        logger.warning(f"❌ Прокси {proxy_object.host}:{proxy_object.port}: {error_msg}")
+        return proxy_object.id, False, error_msg
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка при проверке прокси {proxy_url}: {e}")
-        return proxy_id, False, str(e)
+        error_msg = f"Общая ошибка: {str(e)}"
+        logger.warning(f"❌ Прокси {proxy_object.host}:{proxy_object.port}: {error_msg}")
+        return proxy_object.id, False, error_msg
 
 def check_all_proxies():
     """
@@ -63,13 +77,8 @@ def check_all_proxies():
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
             for proxy in proxies:
-                # Формируем URL прокси
-                proxy_url = f"{proxy.protocol}://"
-                if proxy.username and proxy.password:
-                    proxy_url += f"{proxy.username}:{proxy.password}@"
-                proxy_url += f"{proxy.host}:{proxy.port}"
-
-                futures.append(executor.submit(check_proxy, proxy.id, proxy_url))
+                # Передаем сам объект прокси, а не URL
+                futures.append(executor.submit(check_proxy, proxy))
 
             for future in concurrent.futures.as_completed(futures):
                 try:

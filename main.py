@@ -5,6 +5,7 @@ import sys
 from datetime import datetime
 from telegram.ext import Updater
 from instagram.monkey_patch import *
+from instagram.client_patch import *  # Импортируем усиленные патчи устройств
 
 # Импортируем наши модули
 from config import (
@@ -16,6 +17,7 @@ from database.db_manager import init_db
 from telegram_bot.bot import setup_bot
 from utils.scheduler import start_scheduler
 from utils.task_queue import start_task_queue  # Добавляем импорт
+from utils.system_monitor import start_system_monitoring, stop_system_monitoring
 
 print(f"Python version: {sys.version}")
 print(f"Python executable: {sys.executable}")
@@ -53,6 +55,10 @@ def main():
     # Запускаем обработчик очереди задач
     logger.info("Запуск обработчика очереди задач...")
     start_task_queue()  # Добавляем запуск очереди задач
+
+    # Запускаем мониторинг системы
+    logger.info("Запуск мониторинга системных ресурсов...")
+    start_system_monitoring()
 
     # Запускаем Telegram бота
     logger.info("Запуск Telegram бота...")

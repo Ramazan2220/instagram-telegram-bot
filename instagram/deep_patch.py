@@ -15,7 +15,7 @@ def apply_deep_patch():
     # Патчим метод _send_private_request
     original_send_private_request = PrivateRequestMixin._send_private_request
 
-    def patched_send_private_request(self, endpoint, **kwargs):
+    def patched_send_private_request(self, *args, **kwargs):
         """
         Патч для метода _send_private_request, который обеспечивает использование
         правильного User-Agent из настроек устройства
@@ -23,10 +23,10 @@ def apply_deep_patch():
         # Если в настройках есть user_agent, устанавливаем его
         if hasattr(self, "settings") and "user_agent" in self.settings:
             self.user_agent = self.settings["user_agent"]
-            logger.info(f"Установлен User-Agent: {self.user_agent}")
+            logger.debug(f"Установлен User-Agent: {self.user_agent}")
 
         # Вызываем оригинальный метод
-        return original_send_private_request(self, endpoint, **kwargs)
+        return original_send_private_request(self, *args, **kwargs)
 
     # Применяем патч
     PrivateRequestMixin._send_private_request = patched_send_private_request

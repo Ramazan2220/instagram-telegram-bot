@@ -4,9 +4,11 @@ from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import joinedload
+from typing import Tuple, Union
 
 from config import DATABASE_URL
-from database.models import Base, InstagramAccount, Proxy, PublishTask, TaskStatus
+from database.models import Base, InstagramAccount, Proxy, PublishTask, TaskStatus, AccountGroup
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +111,17 @@ def add_instagram_account_without_login(username, password, email, email_passwor
         
 
 def get_instagram_account(account_id):
-    """Получает аккаунт Instagram по ID"""
+    """Получает аккаунт Instagram по ID с предзагрузкой связанных данных"""
     try:
+        from sqlalchemy.orm import joinedload
         session = get_session()
-        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        
+        # Используем eager loading для предзагрузки связанных данных
+        account = session.query(InstagramAccount)\
+                         .options(joinedload(InstagramAccount.groups))\
+                         .options(joinedload(InstagramAccount.proxy))\
+                         .filter_by(id=account_id)\
+                         .first()
         session.close()
         return account
     except Exception as e:
@@ -120,10 +129,16 @@ def get_instagram_account(account_id):
         return None
 
 def get_instagram_accounts():
-    """Получает список всех аккаунтов Instagram"""
+    """Получает список всех аккаунтов Instagram с предзагрузкой связанных данных"""
     try:
+        from sqlalchemy.orm import joinedload
         session = get_session()
-        accounts = session.query(InstagramAccount).all()
+        
+        # Используем eager loading для предзагрузки связанных данных
+        accounts = session.query(InstagramAccount)\
+                          .options(joinedload(InstagramAccount.groups))\
+                          .options(joinedload(InstagramAccount.proxy))\
+                          .all()
         session.close()
         return accounts
     except Exception as e:
@@ -445,25 +460,35 @@ def assign_proxy_to_account(account_id, proxy_id):
         logger.error(f"Ошибка при назначении прокси аккаунту: {e}")
         return False, str(e)
 
-def create_publish_task(account_id, task_type, media_path, caption="", scheduled_time=None, additional_data=None):
+def create_publish_task(account_id, task_type, media_path, caption="", scheduled_time=None, additional_data=None, user_id=None):
     """Создает новую задачу на публикацию"""
     try:
         session = get_session()
+
+        # Определяем статус задачи
+        if scheduled_time:
+            status = TaskStatus.SCHEDULED
+        else:
+            status = TaskStatus.PENDING
 
         task = PublishTask(
             account_id=account_id,
             task_type=task_type,
             media_path=media_path,
             caption=caption,
-            status=TaskStatus.PENDING,
+            status=status,
             scheduled_time=scheduled_time,
-            options=additional_data  # Используем поле options для хранения дополнительных данных
+            options=additional_data,  # Используем поле options для хранения дополнительных данных
+            user_id=user_id  # Добавляем user_id
         )
 
         session.add(task)
         session.commit()
         task_id = task.id
         session.close()
+
+        logger.info(f"✅ Создана задача #{task_id} со статусом {status.value}" + 
+                   (f" на {scheduled_time}" if scheduled_time else ""))
 
         return True, task_id
     except Exception as e:
@@ -482,9 +507,21 @@ def update_publish_task_status(task_id, status, error_message=None, media_id=Non
 
         task.status = status
         task.error_message = error_message
-        task.media_id = media_id
+        task.media_id = media_id  # Теперь у нас есть это поле!
 
-        if status == TaskStatus.COMPLETED:
+        # Если задача завершена успешно и есть media_id, сохраняем его также в options для обратной совместимости
+        if status == TaskStatus.COMPLETED and media_id:
+            task.completed_at = datetime.now()
+            
+            # Обновляем options, чтобы включить media_id (для обратной совместимости)
+            try:
+                import json
+                options = json.loads(task.options) if task.options and isinstance(task.options, str) else task.options or {}
+                options['media_id'] = media_id
+                task.options = json.dumps(options)
+            except Exception as e:
+                logger.warning(f"Не удалось обновить options с media_id: {e}")
+        elif status == TaskStatus.COMPLETED:
             task.completed_at = datetime.now()
 
         session.commit()
@@ -506,9 +543,34 @@ def get_publish_task(task_id):
     """Получает задачу на публикацию по ID"""
     try:
         session = get_session()
-        task = session.query(PublishTask).filter_by(id=task_id).first()
-        session.close()
-        return task
+        # Используем joinedload для загрузки связанного аккаунта
+        task = session.query(PublishTask).options(
+            joinedload(PublishTask.account)
+        ).filter_by(id=task_id).first()
+        
+        # Важно: не закрываем сессию сразу, чтобы объект оставался привязанным
+        if task:
+            # Делаем копию данных, которые нам нужны
+            task_data = {
+                'id': task.id,
+                'account_id': task.account_id,
+                'account_username': task.account.username if task.account else None,
+                'account_email': task.account.email if task.account else None,
+                'account_email_password': task.account.email_password if task.account else None,
+                'task_type': task.task_type,
+                'status': task.status,
+                'media_path': task.media_path,
+                'caption': task.caption,
+                'hashtags': task.hashtags,
+                'options': task.options,
+                'user_id': task.user_id,  # Добавляем user_id
+                'account': task.account  # Сохраняем ссылку на объект аккаунта
+            }
+            session.close()
+            return task_data
+        else:
+            session.close()
+            return None
     except Exception as e:
         logger.error(f"Ошибка при получении задачи: {e}")
         return None
@@ -545,8 +607,29 @@ def get_pending_tasks():
 
 def get_scheduled_tasks():
     """Получает список запланированных задач, готовых к выполнению"""
-    # Временно отключаем функционал запланированных задач
-    return []
+    try:
+        session = get_session()
+        # Получаем задачи со статусом SCHEDULED или PENDING, у которых есть scheduled_time
+        tasks = session.query(PublishTask).filter(
+            PublishTask.scheduled_time.isnot(None),
+            PublishTask.status.in_([TaskStatus.SCHEDULED, TaskStatus.PENDING])
+        ).options(
+            joinedload(PublishTask.account)
+        ).all()
+        
+        logger.debug(f"📋 Найдено {len(tasks)} запланированных задач")
+        
+        # Не закрываем сессию сразу, чтобы объекты оставались привязанными
+        result = []
+        for task in tasks:
+            result.append(task)
+        
+        session.close()
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при получении списка запланированных задач: {e}")
+        return []
 
 def delete_publish_task(task_id):
     """Удаляет задачу на публикацию"""
@@ -751,12 +834,336 @@ def update_account_session_data(account_id, session_data, last_login=None):
         return False, str(e)
 
 def get_instagram_account_by_username(username):
-    """Получает аккаунт Instagram по имени пользователя"""
+    """Получает аккаунт Instagram по username с предзагрузкой связанных данных"""
     try:
+        from sqlalchemy.orm import joinedload
         session = get_session()
-        account = session.query(InstagramAccount).filter_by(username=username).first()
+        
+        # Используем eager loading для предзагрузки связанных данных
+        account = session.query(InstagramAccount)\
+                         .options(joinedload(InstagramAccount.groups))\
+                         .options(joinedload(InstagramAccount.proxy))\
+                         .filter_by(username=username)\
+                         .first()
         session.close()
         return account
     except Exception as e:
-        logger.error(f"Ошибка при получении аккаунта по имени пользователя: {e}")
+        logger.error(f"Ошибка при получении аккаунта по username: {e}")
         return None
+
+def generate_and_save_device_id(account_id):
+    """Генерирует и сохраняет уникальный device_id для аккаунта"""
+    import uuid
+    import random
+    import string
+    
+    try:
+        # Генерируем device_id в формате, похожем на реальный Instagram device_id
+        # Формат: android-<hex_string>
+        random_hex = ''.join(random.choices(string.hexdigits.lower(), k=16))
+        device_id = f"android-{random_hex}"
+        
+        # Сохраняем в базе данных
+        session = get_session()
+        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        
+        if not account:
+            session.close()
+            return False, "Аккаунт не найден"
+        
+        # Если device_id уже существует, возвращаем его
+        if account.device_id:
+            session.close()
+            return True, account.device_id
+        
+        account.device_id = device_id
+        session.commit()
+        session.close()
+        
+        logger.info(f"Device ID сгенерирован для аккаунта {account.username}: {device_id}")
+        return True, device_id
+        
+    except Exception as e:
+        logger.error(f"Ошибка при генерации device_id для аккаунта {account_id}: {e}")
+        return False, str(e)
+
+def get_or_create_device_id(account_id):
+    """Получает существующий device_id или создает новый для аккаунта"""
+    try:
+        session = get_session()
+        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        
+        if not account:
+            session.close()
+            return None
+        
+        if account.device_id:
+            session.close()
+            return account.device_id
+        
+        session.close()
+        
+        # Если device_id нет, генерируем новый
+        success, device_id = generate_and_save_device_id(account_id)
+        if success:
+            return device_id
+        else:
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка при получении/создании device_id для аккаунта {account_id}: {e}")
+        return None
+
+def ensure_account_device_consistency(account_id):
+    """Обеспечивает консистентность настроек устройства и прокси для аккаунта"""
+    try:
+        session = get_session()
+        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        
+        if not account:
+            session.close()
+            return False, "Аккаунт не найден"
+        
+        changes_made = False
+        
+        # Проверяем и создаем device_id если необходимо
+        if not account.device_id:
+            success, device_id = generate_and_save_device_id(account_id)
+            if success:
+                changes_made = True
+                logger.info(f"Device ID создан для аккаунта {account.username}")
+        
+        # Проверяем назначение прокси если не назначен
+        if not account.proxy_id:
+            from utils.proxy_manager import assign_proxy_to_account
+            proxy_success, proxy_message = assign_proxy_to_account(account_id)
+            if proxy_success:
+                changes_made = True
+                logger.info(f"Прокси назначен аккаунту {account.username}")
+        
+        session.close()
+        
+        if changes_made:
+            return True, "Настройки аккаунта обновлены"
+        else:
+            return True, "Все настройки аккаунта актуальны"
+            
+    except Exception as e:
+        logger.error(f"Ошибка при проверке консистентности аккаунта {account_id}: {e}")
+        return False, str(e)
+
+# ===============================================
+# Функции для работы с группами аккаунтов
+# ===============================================
+
+def create_account_group(name: str, description: str = None, icon: str = '📁') -> Tuple[bool, Union[int, str]]:
+    """
+    Создает новую группу аккаунтов
+    
+    Args:
+        name: Название группы
+        description: Описание группы
+        icon: Эмодзи иконка
+        
+    Returns:
+        (success, group_id или сообщение об ошибке)
+    """
+    session = Session()
+    try:
+        # Проверяем, не существует ли уже группа с таким именем
+        existing = session.query(AccountGroup).filter_by(name=name).first()
+        if existing:
+            return False, "Группа с таким именем уже существует"
+        
+        group = AccountGroup(
+            name=name,
+            description=description,
+            icon=icon
+        )
+        
+        session.add(group)
+        session.commit()
+        
+        logger.info(f"✅ Создана группа аккаунтов: {name} (ID: {group.id})")
+        return True, group.id
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Ошибка при создании группы: {e}")
+        return False, str(e)
+    finally:
+        session.close()
+
+def get_account_groups():
+    """Получает список всех групп аккаунтов"""
+    session = Session()
+    try:
+        groups = session.query(AccountGroup).order_by(AccountGroup.name).all()
+        return groups
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка групп: {e}")
+        return []
+    finally:
+        session.close()
+
+def get_account_group(group_id: int):
+    """Получает группу по ID"""
+    session = Session()
+    try:
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        return group
+    except Exception as e:
+        logger.error(f"Ошибка при получении группы {group_id}: {e}")
+        return None
+    finally:
+        session.close()
+
+def update_account_group(group_id: int, name: str = None, description: str = None, icon: str = None) -> Tuple[bool, str]:
+    """Обновляет информацию о группе"""
+    session = Session()
+    try:
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        if not group:
+            return False, "Группа не найдена"
+        
+        if name:
+            group.name = name
+        if description is not None:
+            group.description = description
+        if icon:
+            group.icon = icon
+        
+        session.commit()
+        logger.info(f"✅ Группа {group_id} обновлена")
+        return True, "Группа успешно обновлена"
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Ошибка при обновлении группы: {e}")
+        return False, str(e)
+    finally:
+        session.close()
+
+def delete_account_group(group_id: int) -> Tuple[bool, str]:
+    """Удаляет группу аккаунтов"""
+    session = Session()
+    try:
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        if not group:
+            return False, "Группа не найдена"
+        
+        session.delete(group)
+        session.commit()
+        
+        logger.info(f"✅ Группа {group.name} удалена")
+        return True, "Группа успешно удалена"
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Ошибка при удалении группы: {e}")
+        return False, str(e)
+    finally:
+        session.close()
+
+def add_account_to_group(account_id: int, group_id: int) -> Tuple[bool, str]:
+    """Добавляет аккаунт в группу"""
+    session = Session()
+    try:
+        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        if not account:
+            return False, "Аккаунт не найден"
+        
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        if not group:
+            return False, "Группа не найдена"
+        
+        if group not in account.groups:
+            account.groups.append(group)
+            session.commit()
+            logger.info(f"✅ Аккаунт {account.username} добавлен в группу {group.name}")
+            return True, "Аккаунт добавлен в группу"
+        else:
+            return False, "Аккаунт уже находится в этой группе"
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Ошибка при добавлении аккаунта в группу: {e}")
+        return False, str(e)
+    finally:
+        session.close()
+
+def remove_account_from_group(account_id: int, group_id: int) -> Tuple[bool, str]:
+    """Удаляет аккаунт из группы"""
+    session = Session()
+    try:
+        account = session.query(InstagramAccount).filter_by(id=account_id).first()
+        if not account:
+            return False, "Аккаунт не найден"
+        
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        if not group:
+            return False, "Группа не найдена"
+        
+        if group in account.groups:
+            account.groups.remove(group)
+            session.commit()
+            logger.info(f"✅ Аккаунт {account.username} удален из группы {group.name}")
+            return True, "Аккаунт удален из группы"
+        else:
+            return False, "Аккаунт не находится в этой группе"
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Ошибка при удалении аккаунта из группы: {e}")
+        return False, str(e)
+    finally:
+        session.close()
+
+def get_accounts_in_group(group_id: int):
+    """Получает список аккаунтов в группе"""
+    session = Session()
+    try:
+        group = session.query(AccountGroup).filter_by(id=group_id).first()
+        if not group:
+            return []
+        
+        accounts = group.accounts
+        return accounts
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении аккаунтов группы: {e}")
+        return []
+    finally:
+        session.close()
+
+def get_accounts_without_group():
+    """Получает список аккаунтов, не входящих ни в одну группу"""
+    session = Session()
+    try:
+        # Получаем все аккаунты без групп
+        accounts = session.query(InstagramAccount).filter(
+            ~InstagramAccount.groups.any()
+        ).all()
+        return accounts
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении аккаунтов без группы: {e}")
+        return []
+    finally:
+        session.close()
+
+def get_accounts_without_group():
+    """Получает список аккаунтов, не входящих ни в одну группу"""
+    session = Session()
+    try:
+        # Получаем все аккаунты без групп
+        accounts = session.query(InstagramAccount).filter(
+            ~InstagramAccount.groups.any()
+        ).all()
+        return accounts
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении аккаунтов без группы: {e}")
+        return []
+    finally:
+        session.close()

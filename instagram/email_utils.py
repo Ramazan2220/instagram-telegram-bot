@@ -14,6 +14,12 @@ from config import VERIFICATION_BOT_TOKEN, VERIFICATION_BOT_ADMIN_ID
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from config import ACCOUNTS_DIR
+import json
+import traceback
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -168,11 +174,7 @@ def get_imap_server(email):
     """
     domain = email.split('@')[-1].lower()
 
-    # Проверяем, является ли домен одним из FirstMail доменов
-    if domain in FIRSTMAIL_DOMAINS or domain.endswith('.firstmail.ltd'):
-        return "imap.firstmail.ltd"
-
-    # Для других известных провайдеров
+    # Для основных известных провайдеров используем их серверы
     if domain == "gmail.com":
         return "imap.gmail.com"
     elif domain in ["mail.ru", "bk.ru", "inbox.ru", "list.ru"]:
@@ -183,17 +185,10 @@ def get_imap_server(email):
         return "outlook.office365.com"
     elif domain == "yahoo.com":
         return "imap.mail.yahoo.com"
-
-    # Для неизвестных доменов пробуем стандартный формат или FirstMail
-    try:
-        # Пробуем стандартный формат
-        standard_server = f"imap.{domain}"
-        mail = imaplib.IMAP4_SSL(standard_server)
-        mail.logout()
-        return standard_server
-    except:
-        # Если не удалось подключиться, используем FirstMail
-        return "imap.firstmail.ltd"
+    
+    # Для всех остальных доменов (включая FirstMail и неизвестные) используем FirstMail
+    # Поскольку у FirstMail более 100000 доменов, проще считать все неизвестные домены FirstMail
+    return "imap.firstmail.ltd"
 
 def get_latest_instagram_emails(email, password, since_time=None, limit=5):
     """
@@ -758,7 +753,7 @@ def get_code_from_firstmail_with_imap_tools(email, password, max_attempts=3, del
 
                 # Если не нашли в письмах с подходящей темой, ищем в любых письмах от Instagram
                 for msg in messages:
-                    if "instagram" in msg.from_.lower():
+                    if msg.from_ and "instagram" in msg.from_.lower():
                         print(f"[DEBUG] Проверяем письмо от: {msg.from_}, тема: {msg.subject}")
 
                         # Получаем текст письма
@@ -791,43 +786,58 @@ def get_code_from_firstmail_with_imap_tools(email, password, max_attempts=3, del
     print(f"[DEBUG] Не удалось получить код подтверждения после {max_attempts} попыток")
     return None
 
-def get_verification_code_from_email(email, password, max_attempts=5, delay_between_attempts=12):
+def get_verification_code_from_email(email, password, max_attempts=3, delay_between_attempts=5):
     logger.info(f"Запрос кода подтверждения из почты {email}")
     print(f"[DEBUG] Запрос кода подтверждения из почты {email}")
 
     request_time = datetime.now(timezone.utc)
     print(f"[DEBUG] Время запроса кода для фильтрации: {request_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-    imap_server = get_imap_server(email) # Эта функция должна быть определена у вас
+    imap_server = get_imap_server(email)
     if not imap_server:
         logger.error(f"Не удалось определить IMAP-сервер для {email}")
         return None
     print(f"[DEBUG] Используем IMAP-сервер: {imap_server} для {email}")
+    
+    # Пропускаем быструю проверку для FirstMail - она часто вызывает таймауты
+    if imap_server != "imap.firstmail.ltd":
+        try:
+            print(f"[DEBUG] Быстрая проверка подключения к {imap_server}...")
+            test_mail = imaplib.IMAP4_SSL(imap_server, 993, timeout=30)
+            test_mail.login(email, password)
+            test_mail.logout()
+            print(f"[DEBUG] ✅ Подключение к {imap_server} работает для {email}")
+        except Exception as e:
+            print(f"[DEBUG] ❌ Быстрая проверка подключения не удалась: {e}")
+            logger.error(f"Быстрая проверка подключения не удалась для {email}: {e}")
+            return None
+    else:
+        print(f"[DEBUG] Пропускаем быструю проверку для FirstMail - переходим к основному процессу")
 
     for attempt in range(1, max_attempts + 1):
         print(f"[DEBUG] Попытка {attempt}/{max_attempts} получения кода из почты {email}")
         mail = None
         try:
-            mail = imaplib.IMAP4_SSL(imap_server, 993, timeout=30)
+            # Увеличиваем таймаут для FirstMail, так как их сервер часто медленный
+            timeout = 90 if imap_server == "imap.firstmail.ltd" else 60
+            print(f"[DEBUG] Подключение к {imap_server} для {email} (таймаут: {timeout}с)...")
+            mail = imaplib.IMAP4_SSL(imap_server, 993, timeout=timeout)
+            print(f"[DEBUG] Попытка входа в IMAP для {email}...")
             mail.login(email, password)
             print(f"[DEBUG] Успешный вход в IMAP {email}")
 
-            # Список стандартных ASCII имен папок + попытка для локализованных
+            # Список папок для поиска
             folders_to_try = ['INBOX', 'Spam', 'Junk']
-            # Для русских имен папок imaplib должен сам корректно кодировать их в Modified UTF-7.
-            # Если select не срабатывает, проблема может быть в том, что сервер не отдает эти папки
-            # или они называются иначе. mail.list() может помочь для диагностики имен папок.
             if "firstmail" in imap_server or "fmailler" in imap_server:
-                 folders_to_try.extend(['Нежелательная почта', 'Спам'])
-
+                folders_to_try.extend(['Нежелательная почта', 'Спам'])
 
             found_code_from_any_folder = None
 
             for folder_name_candidate in folders_to_try:
-                if found_code_from_any_folder: break
+                if found_code_from_any_folder: 
+                    break
                 try:
                     print(f"[DEBUG] Попытка выбора папки: '{folder_name_candidate}' для {email}")
-                    # imaplib должен сам обрабатывать кодировку для select
                     status_select, _ = mail.select(folder_name_candidate)
                     
                     if status_select != 'OK':
@@ -835,97 +845,162 @@ def get_verification_code_from_email(email, password, max_attempts=5, delay_betw
                         continue
                     print(f"[DEBUG] Успешно выбрана папка: '{folder_name_candidate}' для {email}")
 
-                    # Ищем письма не старше 20 минут
-                    since_date_criteria_str = (request_time - timedelta(minutes=20)).strftime("%d-%b-%Y")
+                    # Ищем письма не старше 3 минут (был 30 минут) - только свежие коды
+                    since_time_search = request_time - timedelta(minutes=3)
+                    since_date_criteria_str = since_time_search.strftime("%d-%b-%Y")
                     
-                    # КРИТЕРИИ ПОИСКА - ТОЛЬКО ASCII!
-                    # Сервер firstmail не понимает UTF-8 в команде SEARCH и не любит не-ASCII символы.
+                    # Расширенные критерии поиска с фокусом на Instagram
                     search_criteria_options = [
+                        # Сначала самые специфичные для Instagram
+                        f'(SINCE "{since_date_criteria_str}" FROM "security@mail.instagram.com")',
                         f'(SINCE "{since_date_criteria_str}" FROM "instagram.com")',
+                        f'(SINCE "{since_date_criteria_str}" SUBJECT "Instagram security code")',
                         f'(SINCE "{since_date_criteria_str}" SUBJECT "Instagram")',
+                        f'(SINCE "{since_date_criteria_str}" SUBJECT "security code")',
+                        f'(SINCE "{since_date_criteria_str}" SUBJECT "verification code")',
                         f'(SINCE "{since_date_criteria_str}" SUBJECT "code")',
                         f'(SINCE "{since_date_criteria_str}" SUBJECT "security")',
-                        # Более общие, если предыдущие не сработали:
+                        # Более общие запросы, если специфичные не сработали
+                        f'(UNSEEN FROM "security@mail.instagram.com")',
                         f'(UNSEEN FROM "instagram.com")',
-                        f'(UNSEEN SUBJECT "Instagram")' # Ищет непрочитанные
+                        f'(UNSEEN SUBJECT "Instagram")',
+                        f'(UNSEEN SUBJECT "security")',
+                        # Самый общий запрос на случай, если ничего не найдено
+                        f'(SINCE "{since_date_criteria_str}")',
                     ]
                     
                     email_ids_to_fetch = set()
 
                     for criteria_str in search_criteria_options:
                         try:
-                            print(f"[DEBUG] Выполняем поиск с ASCII критерием: {criteria_str}")
-                            # Команда SEARCH без указания charset. Критерии должны быть ASCII.
+                            print(f"[DEBUG] Выполняем поиск с критерием: {criteria_str}")
                             status_search, messages_search_data = mail.search(None, criteria_str)
                             if status_search == "OK" and messages_search_data[0]:
-                                for email_id_b_val_search in messages_search_data[0].split():
-                                    email_ids_to_fetch.add(email_id_b_val_search)
-                            # else:
-                                # print(f"[DEBUG] Поиск по '{criteria_str}' не дал результатов или ошибка: {status_search}, {messages_search_data}")
+                                new_ids = messages_search_data[0].split()
+                                email_ids_to_fetch.update(new_ids)
+                                print(f"[DEBUG] Найдено {len(new_ids)} писем по критерию '{criteria_str}'")
+                            else:
+                                print(f"[DEBUG] Поиск по '{criteria_str}' не дал результатов")
                         except Exception as e_search_detail_exc:
-                            print(f"[DEBUG] Ошибка при выполнении поиска '{criteria_str}' в '{folder_name_candidate}': {e_search_detail_exc}")
+                            print(f"[DEBUG] Ошибка при выполнении поиска '{criteria_str}': {e_search_detail_exc}")
                     
                     if not email_ids_to_fetch:
-                        print(f"[DEBUG] Письма, подходящие под ASCII критерии, не найдены в папке '{folder_name_candidate}'")
+                        print(f"[DEBUG] Письма не найдены в папке '{folder_name_candidate}'")
                         continue
                     
-                    print(f"[DEBUG] Найдено {len(email_ids_to_fetch)} уникальных потенциальных писем в '{folder_name_candidate}'. Загружаем и фильтруем...")
+                    print(f"[DEBUG] Найдено {len(email_ids_to_fetch)} уникальных писем в '{folder_name_candidate}'. Загружаем и проверяем...")
 
-                    # Загружаем письма и проверяем их содержимое
-                    # (Логика загрузки и парсинга остается схожей с предыдущей версией,
-                    # важно, что сам SEARCH теперь ASCII-безопасный)
-                    
+                    # Обрабатываем письма с сортировкой по дате
                     processed_emails_in_folder = []
                     for email_id_b_val_proc in email_ids_to_fetch:
                         try:
+                            # Получаем заголовки для первичной фильтрации
                             status_fetch_hdr_proc, msg_data_hdr_proc = mail.fetch(email_id_b_val_proc, "(BODY[HEADER.FIELDS (SUBJECT DATE FROM)])")
                             if status_fetch_hdr_proc == "OK":
                                 header_msg_obj_proc = email_lib.message_from_bytes(msg_data_hdr_proc[0][1])
+                                
+                                # Парсим дату письма
                                 email_date_str_proc = header_msg_obj_proc.get('Date')
                                 email_datetime_obj_proc = None
                                 if email_date_str_proc:
-                                    try: email_datetime_obj_proc = email_lib.utils.parsedate_to_datetime(email_date_str_proc)
-                                    except Exception: pass
+                                    try: 
+                                        email_datetime_obj_proc = email_lib.utils.parsedate_to_datetime(email_date_str_proc)
+                                    except Exception as date_error:
+                                        print(f"[DEBUG] Ошибка парсинга даты '{email_date_str_proc}': {date_error}")
                                 
+                                # Получаем тему письма
                                 subject_h_proc = ""
                                 subject_header_val_proc = header_msg_obj_proc.get("Subject", "")
                                 if subject_header_val_proc:
                                     decoded_s_h_proc = decode_header(subject_header_val_proc)
                                     for s_part_h_proc, s_charset_h_proc in decoded_s_h_proc:
-                                        if isinstance(s_part_h_proc, bytes): subject_h_proc += s_part_h_proc.decode(s_charset_h_proc or 'utf-8', 'replace')
-                                        else: subject_h_proc += s_part_h_proc
-                                processed_emails_in_folder.append({'id': email_id_b_val_proc, 'date': email_datetime_obj_proc, 'subject': subject_h_proc})
+                                        if isinstance(s_part_h_proc, bytes): 
+                                            subject_h_proc += s_part_h_proc.decode(s_charset_h_proc or 'utf-8', 'replace')
+                                        else: 
+                                            subject_h_proc += s_part_h_proc
+
+                                # Получаем отправителя
+                                from_header = header_msg_obj_proc.get("From", "")
+                                
+                                processed_emails_in_folder.append({
+                                    'id': email_id_b_val_proc, 
+                                    'date': email_datetime_obj_proc, 
+                                    'subject': subject_h_proc,
+                                    'from': from_header
+                                })
                         except Exception as e_fetch_hdr_proc_exc:
                              print(f"[DEBUG] Ошибка при загрузке заголовка письма ID {email_id_b_val_proc.decode()}: {e_fetch_hdr_proc_exc}")
                     
-                    processed_emails_in_folder.sort(key=lambda x_item_proc: x_item_proc['date'] or datetime.min.replace(tzinfo=timezone.utc))
+                    # Сортируем письма по дате (новые сначала)
+                    processed_emails_in_folder.sort(
+                        key=lambda x_item_proc: x_item_proc['date'] or datetime.min.replace(tzinfo=timezone.utc), 
+                        reverse=True
+                    )
 
-                    for detail_item_proc in reversed(processed_emails_in_folder): 
+                    # Обрабатываем письма от новых к старым
+                    for detail_item_proc in processed_emails_in_folder: 
                         current_email_id_b_proc = detail_item_proc['id']
                         current_subject_proc = detail_item_proc['subject']
+                        current_from_proc = detail_item_proc['from']
 
-                        # Фильтр по дате (письма не старше 20 минут от request_time)
-                        if detail_item_proc['date'] and detail_item_proc['date'] < (request_time - timedelta(minutes=20)):
-                            continue
+                        print(f"[DEBUG] Проверяем письмо ID {current_email_id_b_proc.decode()}")
+                        print(f"[DEBUG] От: {current_from_proc}")
+                        print(f"[DEBUG] Тема: '{current_subject_proc}'")
+                        print(f"[DEBUG] Дата: {detail_item_proc['date']}")
 
-                        skip_subject_keywords_list = ["новый вход", "new login", "новое устройство", "new device", "запрос на сброс пароля", "password reset", "сбросить пароль"]
+                        # Фильтр по дате - проверяем, что письмо не старше 3 минут И не старше времени запроса
+                        if detail_item_proc['date']:
+                            # Письмо должно быть новее времени запроса кода (с увеличенным буфером -5 минут для тестирования)
+                            min_time = request_time - timedelta(minutes=5)
+                            if detail_item_proc['date'] < min_time:
+                                print(f"[DEBUG] Пропуск письма - старше времени запроса кода ({detail_item_proc['date']} < {min_time})")
+                                continue
+                            
+                            # И не старше 3 минут от текущего времени
+                            if detail_item_proc['date'] < since_time_search:
+                                print(f"[DEBUG] Пропуск письма - слишком старое ({detail_item_proc['date']} < {since_time_search})")
+                                continue
+
+                        # Пропускаем письма, которые точно не содержат код верификации
+                        skip_subject_keywords_list = [
+                            "новый вход", "new login", "новое устройство", "new device", 
+                            "запрос на сброс пароля", "password reset", "сбросить пароль",
+                            "welcome", "добро пожаловать", "account created", "аккаунт создан"
+                        ]
                         
                         if any(keyword_skip in current_subject_proc.lower() for keyword_skip in skip_subject_keywords_list):
-                            print(f"[DEBUG] Пропуск письма ID {current_email_id_b_proc.decode()} с темой '{current_subject_proc}' (информационное/сброс)")
+                            print(f"[DEBUG] Пропуск письма - информационное/сброс пароля")
                             continue
+
+                        # Приоритет письмам от Instagram
+                        is_instagram_email = any(domain in current_from_proc.lower() for domain in [
+                            "instagram.com", "mail.instagram.com", "security@mail.instagram.com"
+                        ])
                         
-                        print(f"[DEBUG] Загрузка полного тела письма ID {current_email_id_b_proc.decode()} с темой '{current_subject_proc}'")
+                        # Приоритет письмам с ключевыми словами в теме
+                        has_verification_keywords = any(keyword in current_subject_proc.lower() for keyword in [
+                            "security code", "verification code", "код подтверждения", "код безопасности"
+                        ])
+
+                        print(f"[DEBUG] Instagram email: {is_instagram_email}, Has verification keywords: {has_verification_keywords}")
+                        
+                        # Загружаем полное содержимое письма
+                        print(f"[DEBUG] Загрузка полного тела письма")
                         status_fetch_full_body_proc, msg_data_full_body_proc = mail.fetch(current_email_id_b_proc, "(RFC822)")
-                        if status_fetch_full_body_proc != "OK": continue
+                        if status_fetch_full_body_proc != "OK": 
+                            print(f"[DEBUG] Не удалось загрузить тело письма")
+                            continue
 
                         msg_full_obj_proc = email_lib.message_from_bytes(msg_data_full_body_proc[0][1])
                         text_content_proc, html_content_proc = "", ""
 
+                        # Извлекаем текст и HTML
                         if msg_full_obj_proc.is_multipart():
                             for part_item_proc in msg_full_obj_proc.walk():
                                 content_type_proc = part_item_proc.get_content_type()
                                 content_disposition_proc = str(part_item_proc.get("Content-Disposition"))
-                                if "attachment" in content_disposition_proc: continue
+                                if "attachment" in content_disposition_proc: 
+                                    continue
                                 try:
                                     payload_proc = part_item_proc.get_payload(decode=True)
                                     charset_proc = part_item_proc.get_content_charset() or 'utf-8'
@@ -934,30 +1009,48 @@ def get_verification_code_from_email(email, password, max_attempts=5, delay_betw
                                     elif content_type_proc == "text/html":
                                         html_content_proc += payload_proc.decode(charset_proc, errors='replace')
                                 except Exception as e_decode_part_proc:
-                                    print(f"[DEBUG] Ошибка декодирования части письма ID {current_email_id_b_proc.decode()}: {e_decode_part_proc}")
+                                    print(f"[DEBUG] Ошибка декодирования части письма: {e_decode_part_proc}")
                         else:
                             try:
                                 payload_single_proc = msg_full_obj_proc.get_payload(decode=True)
                                 charset_single_proc = msg_full_obj_proc.get_content_charset() or 'utf-8'
                                 content_body_single_proc = payload_single_proc.decode(charset_single_proc, errors='replace')
-                                if msg_full_obj_proc.get_content_type() == "text/html": html_content_proc = content_body_single_proc
-                                else: text_content_proc = content_body_single_proc
+                                if msg_full_obj_proc.get_content_type() == "text/html": 
+                                    html_content_proc = content_body_single_proc
+                                else: 
+                                    text_content_proc = content_body_single_proc
                             except Exception as e_decode_single_part_proc:
-                                print(f"[DEBUG] Ошибка декодирования не-мультипартного письма ID {current_email_id_b_proc.decode()}: {e_decode_single_part_proc}")
+                                print(f"[DEBUG] Ошибка декодирования письма: {e_decode_single_part_proc}")
                         
-                        email_data_to_save_proc = {'subject': current_subject_proc, 'text': text_content_proc, 'html': html_content_proc}
-                        # save_email_to_file(email, email_data_to_save_proc, None) # Раскомментируйте для сохранения всех проверяемых писем
+                        # Создаем данные для сохранения
+                        email_data_to_save_proc = {
+                            'subject': current_subject_proc, 
+                            'text': text_content_proc, 
+                            'html': html_content_proc,
+                            'from': current_from_proc
+                        }
 
-                        # Функция extract_verification_code должна уметь находить код в русскоязычных и англоязычных темах/телах
+                        # Ищем код верификации
                         code_val_proc = extract_verification_code(current_subject_proc, text_content_proc, html_content_proc)
                         if code_val_proc:
-                            print(f"[DEBUG] Найден код подтверждения: {code_val_proc} для {email} в письме ID {current_email_id_b_proc.decode()} из папки '{folder_name_candidate}'")
-                            save_email_to_file(email, email_data_to_save_proc, code_val_proc) # Сохраняем письмо с кодом
+                            print(f"[DEBUG] ✅ НАЙДЕН КОД ПОДТВЕРЖДЕНИЯ: {code_val_proc} для {email}")
+                            print(f"[DEBUG] В письме ID {current_email_id_b_proc.decode()} из папки '{folder_name_candidate}'")
+                            print(f"[DEBUG] От: {current_from_proc}")
+                            print(f"[DEBUG] Тема: {current_subject_proc}")
+                            
+                            # Сохраняем письмо с найденным кодом
+                            save_email_to_file(email, email_data_to_save_proc, code_val_proc)
+                            
                             found_code_from_any_folder = code_val_proc
                             break 
+                        else:
+                            # Если это письмо от Instagram, сохраняем его для отладки
+                            if is_instagram_email or has_verification_keywords:
+                                print(f"[DEBUG] Письмо от Instagram без кода - сохраняем для отладки")
+                                save_email_to_file(email, email_data_to_save_proc, None)
                 
                 except Exception as folder_processing_error_detail_exc:
-                    print(f"[DEBUG] Ошибка при обработке папки '{folder_name_candidate}' для {email}: {folder_processing_error_detail_exc}")
+                    print(f"[DEBUG] Ошибка при обработке папки '{folder_name_candidate}': {folder_processing_error_detail_exc}")
             
             if found_code_from_any_folder:
                 if mail:
@@ -965,32 +1058,65 @@ def get_verification_code_from_email(email, password, max_attempts=5, delay_betw
                     except: pass
                     try: mail.logout()
                     except: pass
+                print(f"[DEBUG] ✅ Успешно найден код {found_code_from_any_folder} для {email}")
+                logger.info(f"Успешно найден код {found_code_from_any_folder} для {email}")
                 return found_code_from_any_folder
 
-            print(f"[DEBUG] Код не найден для {email} на попытке {attempt}, ожидание {delay_between_attempts} секунд")
+            print(f"[DEBUG] ❌ Код не найден для {email} на попытке {attempt}")
+            if attempt < max_attempts:
+                print(f"[DEBUG] Ожидание {delay_between_attempts} секунд перед следующей попыткой")
+            
             if mail:
                 try: mail.close()
                 except: pass
                 try: mail.logout()
                 except: pass
-            time.sleep(delay_between_attempts)
+            
+            if attempt < max_attempts:
+                time.sleep(delay_between_attempts)
 
         except imaplib.IMAP4.error as imap_auth_err_detail:
-            logger.error(f"Ошибка IMAP для {email} (попытка {attempt}): {imap_auth_err_detail}. Вероятно, неверный email/пароль или проблема с IMAP-сервером/доступом.")
+            logger.error(f"Ошибка IMAP для {email} (попытка {attempt}): {imap_auth_err_detail}")
+            print(f"[DEBUG] ❌ Ошибка IMAP аутентификации для {email}: {imap_auth_err_detail}")
+            
+            # Помечаем аккаунт как проблемный при ошибке IMAP
+            mark_account_problematic(email, "imap_auth_failed", f"Ошибка IMAP аутентификации: {imap_auth_err_detail}")
+            
             if mail:
                 try: mail.logout() 
                 except: pass
             return None 
         except Exception as e_outer_attempt_exc:
+            error_msg = str(e_outer_attempt_exc).lower()
             logger.error(f"Общая ошибка при получении кода для {email} (попытка {attempt}): {e_outer_attempt_exc}")
+            print(f"[DEBUG] ❌ Общая ошибка для {email} (попытка {attempt}): {e_outer_attempt_exc}")
+            
+            # Отслеживаем таймауты и другие ошибки
+            if "timed out" in error_msg:
+                print(f"[DEBUG] Таймаут для {email} на попытке {attempt}")
+                # Если это последняя попытка и все были таймауты, помечаем аккаунт
+                if attempt == max_attempts:
+                    mark_account_problematic(email, "email_timeout", f"Постоянные таймауты при подключении к почте: {e_outer_attempt_exc}")
+            elif "authentication failed" in error_msg or "login failed" in error_msg:
+                print(f"[DEBUG] Ошибка аутентификации для {email}")
+                mark_account_problematic(email, "email_auth_failed", f"Ошибка аутентификации почты: {e_outer_attempt_exc}")
+                return None  # Прекращаем попытки при ошибке аутентификации
+            
             if mail:
                 try: mail.close()
                 except: pass
                 try: mail.logout()
                 except: pass
-            time.sleep(delay_between_attempts)
+            
+            if attempt < max_attempts:
+                time.sleep(delay_between_attempts)
 
-    logger.warning(f"Не удалось получить код подтверждения для {email} после {max_attempts} попыток")
+    logger.warning(f"❌ Не удалось получить код подтверждения для {email} после {max_attempts} попыток")
+    print(f"[DEBUG] ❌ ФИНАЛ: Не удалось получить код для {email} после {max_attempts} попыток")
+    
+    # Помечаем аккаунт как проблемный после всех неудачных попыток
+    mark_account_problematic(email, "email_failed", f"Не удалось получить код из email после {max_attempts} попыток")
+    
     return None
 
 def get_code_from_generic_email(email, password, max_attempts=3, delay_between_attempts=5):
@@ -1057,7 +1183,7 @@ def get_code_from_generic_email(email, password, max_attempts=3, delay_between_a
                 print(f"[DEBUG] Проверяем письмо от: {from_header}, тема: {subject_header}")
 
                 # Проверяем, от Instagram ли письмо
-                if "instagram" in from_header.lower() or "security code" in subject_header.lower():
+                if (from_header and "instagram" in from_header.lower()) or (subject_header and "security code" in subject_header.lower()):
                     # Получаем текст письма
                     message_text = ""
                     html_content = ""
@@ -1492,3 +1618,59 @@ def cleanup_email_logs(email):
     except Exception as e:
         print(f"[DEBUG] Ошибка при очистке файлов писем: {str(e)}")
         logger.error(f"Ошибка при очистке файлов писем: {str(e)}")
+
+# Функция для отметки проблемных аккаунтов
+def mark_account_problematic(email, error_type, error_message):
+    """
+    Помечает аккаунт как проблемный в базе данных
+    
+    Args:
+        email (str): Email аккаунта
+        error_type (str): Тип ошибки (email_timeout, email_failed, etc.)
+        error_message (str): Сообщение об ошибке
+    """
+    try:
+        from database.db_manager import get_session, update_instagram_account
+        from database.models import InstagramAccount, AccountGroup
+        
+        session = get_session()
+        account = session.query(InstagramAccount).filter_by(email=email).first()
+        if account:
+            # Обновляем статус и информацию об ошибке
+            update_instagram_account(
+                account.id,
+                status=error_type,
+                last_error=error_message,
+                is_active=False,  # Помечаем как неактивный
+                last_check=datetime.now()
+            )
+            
+            # Автоматически перемещаем в папку "Неактивные"
+            try:
+                # Ищем или создаем папку "Неактивные"
+                inactive_group = session.query(AccountGroup).filter_by(name="Неактивные").first()
+                if not inactive_group:
+                    inactive_group = AccountGroup(
+                        name="Неактивные",
+                        icon="❌",
+                        description="Автоматически созданная папка для проблемных аккаунтов"
+                    )
+                    session.add(inactive_group)
+                    session.commit()
+                    logger.info("Создана папка 'Неактивные' для проблемных аккаунтов")
+                
+                # Перемещаем аккаунт в папку "Неактивные"
+                account.group_id = inactive_group.id
+                session.commit()
+                logger.info(f"Аккаунт {account.username} перемещен в папку 'Неактивные'")
+                
+            except Exception as move_error:
+                logger.warning(f"Не удалось переместить аккаунт {account.username} в папку 'Неактивные': {move_error}")
+            
+            logger.warning(f"Аккаунт {account.username} помечен как проблемный: {error_type} - {error_message}")
+            print(f"[DEBUG] Аккаунт {account.username} помечен как проблемный: {error_type}")
+        else:
+            logger.warning(f"Аккаунт с email {email} не найден в базе данных")
+        session.close()
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении статуса аккаунта {email}: {e}")

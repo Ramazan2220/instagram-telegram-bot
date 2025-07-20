@@ -5,8 +5,14 @@ import tempfile
 from datetime import datetime
 
 from instagrapi import Client
-from moviepy import editor as moviepy_editor
-VideoFileClip = moviepy_editor.VideoFileClip
+
+# Правильный импорт MoviePy для версии 2.1.2
+try:
+    from moviepy.video.io.VideoFileClip import VideoFileClip
+    MOVIEPY_AVAILABLE = True
+except ImportError:
+    MOVIEPY_AVAILABLE = False
+    logger.warning("MoviePy не установлен. Обработка видео будет отключена.")
 
 from config import ACCOUNTS_DIR
 from database.db_manager import get_session, get_instagram_account, update_publish_task_status, get_publish_task
@@ -78,6 +84,10 @@ def get_instagram_client(account_id):
 
 def process_video(video_path):
     """Обрабатывает видео перед публикацией"""
+    if not MOVIEPY_AVAILABLE:
+        logger.info("MoviePy недоступен, пропускаем обработку видео")
+        return video_path, None
+        
     try:
         # Создаем временный файл для обработанного видео
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
@@ -120,7 +130,7 @@ def process_video(video_path):
         return processed_path, None
     except Exception as e:
         logger.error(f"Ошибка при обработке видео: {e}")
-        return None, str(e)
+        return video_path, None  # Возвращаем оригинальный файл в случае ошибки
 
 def publish_video(task_id):
     """Публикует видео в Instagram"""

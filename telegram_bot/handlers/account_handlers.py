@@ -10,7 +10,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
 from telegram.ext import ConversationHandler, CommandHandler, MessageHandler, Filters
 
 from config import ACCOUNTS_DIR, ADMIN_USER_IDS, MEDIA_DIR
-from database.db_manager import get_session, get_instagram_accounts, bulk_add_instagram_accounts, delete_instagram_account, get_instagram_account
+from database.db_manager import (
+    get_session, get_instagram_accounts, bulk_add_instagram_accounts, 
+    delete_instagram_account, get_instagram_account, get_account_groups,
+    update_instagram_account, activate_instagram_account
+)
 from database.models import InstagramAccount, PublishTask
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, BadPassword, ChallengeRequired
@@ -20,6 +24,7 @@ import random
 from database.models import Proxy
 from utils.proxy_manager import assign_proxy_to_account
 from instagram.client import check_login_challenge, submit_challenge_code, test_instagram_login_with_proxy
+from utils.system_monitor import get_adaptive_limits, get_system_status
 
 logger = logging.getLogger(__name__)
 
@@ -94,20 +99,12 @@ def is_admin(user_id):
     return user_id in ADMIN_USER_IDS
 
 def accounts_handler(update, context):
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='add_account')],
-        [InlineKeyboardButton("📋 Список аккаунтов", callback_data='list_accounts')],
-        [InlineKeyboardButton("📤 Загрузить аккаунты", callback_data='upload_accounts')],
-        [InlineKeyboardButton("📤 Асинхронная загрузка аккаунтов", callback_data='async_upload_accounts')],
-        [InlineKeyboardButton("⚙️ Настройка профиля", callback_data='profile_setup')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='main_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    from telegram_bot.keyboards import get_accounts_menu_keyboard
+    
     update.message.reply_text(
-        "🔧 *Меню управления аккаунтами*\n\n"
+        "👤 *Управление аккаунтами*\n\n"
         "Выберите действие из списка ниже:",
-        reply_markup=reply_markup,
+        reply_markup=get_accounts_menu_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -597,95 +594,260 @@ def cancel_add_account(update, context):
     return ConversationHandler.END
 
 def list_accounts_handler(update, context):
+    """Обработчик списка аккаунтов с пагинацией и улучшенным UI"""
     session = get_session()
-    accounts = session.query(InstagramAccount).all()
-    session.close()
-
+    
+    # Получаем страницу из callback_data
+    page = 1
     if update.callback_query:
         query = update.callback_query
         query.answer()
-
-        if not accounts:
-            keyboard = [
-                [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='add_account')],
-                [InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            query.edit_message_text(
-                "У вас пока нет добавленных аккаунтов Instagram.",
-                reply_markup=reply_markup
-            )
-            return
-
-        accounts_text = "📋 *Список ваших аккаунтов Instagram:*\n\n"
-        keyboard = []
-
-        for account in accounts:
-            status = "✅ Активен" if account.is_active else "❌ Неактивен"
-            accounts_text += f"👤 *{account.username}*\n"
-            accounts_text += f"🆔 ID: `{account.id}`\n"
-            accounts_text += f"📅 Добавлен: {account.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-            accounts_text += f"📊 Статус: {status}\n\n"
-
-            # Добавляем кнопку удаления для каждого аккаунта
-            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {account.username}", callback_data=f'delete_account_{account.id}')])
-
-        # Добавляем кнопку для удаления всех аккаунтов
-        if accounts:
-            keyboard.append([InlineKeyboardButton("🗑️ Удалить все аккаунты", callback_data='delete_all_accounts')])
-
-        keyboard.append([InlineKeyboardButton("🔄 Проверить валидность", callback_data='check_accounts_validity')])
-        keyboard.append([InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')])
-
+        
+        # Проверяем, есть ли номер страницы в callback_data
+        if query.data.startswith("list_accounts_page_"):
+            page = int(query.data.replace("list_accounts_page_", ""))
+    
+    # Получаем все аккаунты с их группами (eager loading)
+    from sqlalchemy.orm import joinedload
+    all_accounts = session.query(InstagramAccount).options(joinedload(InstagramAccount.groups)).all()
+    
+    # Сохраняем нужные данные перед закрытием сессии
+    accounts_data = []
+    for acc in all_accounts:
+        accounts_data.append({
+            'id': acc.id,
+            'username': acc.username,
+            'is_active': acc.is_active,
+            'groups': [{'name': g.name, 'icon': g.icon} for g in acc.groups]
+        })
+    
+    session.close()
+    
+    if not accounts_data:
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='add_account')],
+            [InlineKeyboardButton("📥 Массовая загрузка", callback_data='bulk_add_accounts')],
+            [InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        query.edit_message_text(
-            accounts_text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        text = "📋 У вас пока нет добавленных аккаунтов Instagram.\n\n" \
+               "Добавьте аккаунты для начала работы."
+        
+        if update.callback_query:
+            query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            update.message.reply_text(text, reply_markup=reply_markup)
+        return
+    
+    # Пагинация
+    accounts_per_page = 8
+    total_pages = (len(accounts_data) + accounts_per_page - 1) // accounts_per_page
+    start_idx = (page - 1) * accounts_per_page
+    end_idx = min(start_idx + accounts_per_page, len(accounts_data))
+    
+    # Аккаунты на текущей странице
+    page_accounts = accounts_data[start_idx:end_idx]
+    
+    # Формируем статистику
+    active_count = sum(1 for acc in accounts_data if acc['is_active'])
+    inactive_count = len(accounts_data) - active_count
+    groups_count = len(get_account_groups())
+    
+    # Формируем текст
+    text = "📊 *Статистика аккаунтов*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"👥 Всего: {len(accounts_data)}\n"
+    text += f"✅ Активных: {active_count}\n"
+    text += f"❌ Неактивных: {inactive_count}\n"
+    text += f"📁 Папок: {groups_count}\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    text += f"📋 *Аккаунты (стр. {page}/{total_pages}):*\n\n"
+    
+    keyboard = []
+    
+    # Кнопки для каждого аккаунта
+    for i, account in enumerate(page_accounts, start=start_idx+1):
+        status = "✅" if account['is_active'] else "❌"
+        groups = account['groups']
+        group_info = f" [{groups[0]['icon']}]" if groups else ""
+        
+        # Экранируем специальные символы для Markdown
+        username = account['username'].replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
+        
+        # Краткая информация об аккаунте
+        text += f"{i}. {status} @{username}{group_info}\n"
+        
+        # Кнопка для просмотра деталей
+        keyboard.append([InlineKeyboardButton(
+            f"{status} @{account['username']}",
+            callback_data=f"account_details_{account['id']}"
+        )])
+    
+    # Навигация по страницам
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"list_accounts_page_{page-1}"))
+    
+    nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"list_accounts_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    # Кнопки действий
+    action_row1 = []
+    action_row1.append(InlineKeyboardButton("📁 Папки", callback_data="folders_menu"))
+    action_row1.append(InlineKeyboardButton("🔍 Поиск", callback_data="search_accounts"))
+    keyboard.append(action_row1)
+    
+    action_row2 = []
+    action_row2.append(InlineKeyboardButton("🔄 Проверить", callback_data='check_accounts_validity'))
+    action_row2.append(InlineKeyboardButton("➕ Добавить", callback_data='add_account'))
+    keyboard.append(action_row2)
+    
+    keyboard.append([InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
     else:
-        if not accounts:
-            keyboard = [
-                [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='add_account')],
-                [InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
-            update.message.reply_text(
-                "У вас пока нет добавленных аккаунтов Instagram.",
-                reply_markup=reply_markup
-            )
-            return
-
-        accounts_text = "📋 *Список ваших аккаунтов Instagram:*\n\n"
-        keyboard = []
-
-        for account in accounts:
-            status = "✅ Активен" if account.is_active else "❌ Неактивен"
-            accounts_text += f"👤 *{account.username}*\n"
-            accounts_text += f"🆔 ID: `{account.id}`\n"
-            accounts_text += f"📅 Добавлен: {account.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-            accounts_text += f"📊 Статус: {status}\n\n"
-
-            # Добавляем кнопку удаления для каждого аккаунта
-            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {account.username}", callback_data=f'delete_account_{account.id}')])
-
-        # Добавляем кнопку для удаления всех аккаунтов
-        if accounts:
-            keyboard.append([InlineKeyboardButton("🗑️ Удалить все аккаунты", callback_data='delete_all_accounts')])
-
-        keyboard.append([InlineKeyboardButton("🔄 Проверить валидность", callback_data='check_accounts_validity')])
-        keyboard.append([InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text(
-            accounts_text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
+def account_details_handler(update, context):
+    """Показывает детальную информацию об аккаунте"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("account_details_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text(
+            "❌ Аккаунт не найден",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="list_accounts")]])
         )
+        return
+    
+    # Формируем детальную информацию
+    status_emoji = "✅" if account.is_active else "❌"
+    status_text = "Активен" if account.is_active else "Неактивен"
+    
+    # Детальная информация о статусе
+    detailed_status = "Активен"
+    if not account.is_active:
+        if hasattr(account, 'status') and account.status:
+            status_mapping = {
+                'challenge_required': '🔐 Требуется верификация',
+                'login_required': '🔑 Требуется повторный вход',
+                'email_code_failed': '📧 Ошибка получения кода из email',
+                'recovery_login_failed': '🔄 Ошибка входа при восстановлении',
+                'recovery_verify_failed': '❌ Восстановление не подтвердилось',
+                'no_email_data': '📧 Нет данных email для восстановления',
+                'email_error': '📧 Ошибка работы с email',
+                'recovery_error': '🔄 Ошибка восстановления',
+                'invalid_password': '🔑 Неверный пароль',
+                'login_error': '❌ Ошибка входа',
+                'problematic': '⚠️ Проблемный аккаунт'
+            }
+            detailed_status = status_mapping.get(account.status, f"❌ {account.status}")
+        else:
+            detailed_status = "❌ Неактивен"
+    
+    # Экранируем специальные символы для Markdown
+    username = account.username.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
+    email = (account.email or 'Не указан').replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
+    
+    text = f"👤 *Аккаунт: @{username}*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"🆔 ID: `{account.id}`\n"
+    text += f"📊 Статус: {status_emoji} {detailed_status}\n"
+    text += f"📧 Email: {email}\n"
+    
+    # Информация об IMAP восстановлении
+    if account.email and account.email_password:
+        text += f"🔄 IMAP восстановление: ✅ Доступно\n"
+    else:
+        text += f"🔄 IMAP восстановление: ❌ Нет данных\n"
+    
+    text += f"📅 Добавлен: {account.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+    
+    # Последняя проверка
+    if hasattr(account, 'last_check') and account.last_check:
+        text += f"🔍 Последняя проверка: {account.last_check.strftime('%d.%m.%Y %H:%M')}\n"
+    
+    # Информация о группах
+    if account.groups:
+        text += f"\n📁 *Группы:*\n"
+        for group in account.groups:
+            text += f"  • {group.icon} {group.name}\n"
+    else:
+        text += f"\n📁 *Группы:* Не состоит в группах\n"
+    
+    # Информация о прокси
+    if account.proxy:
+        text += f"\n🌐 *Прокси:* {account.proxy.host}:{account.proxy.port}\n"
+    else:
+        text += f"\n🌐 *Прокси:* Не назначен\n"
+    
+    # Последняя ошибка
+    if account.last_error:
+        error_text = account.last_error[:150]
+        # Экранируем ошибку
+        error_text = error_text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
+        text += f"\n⚠️ *Последняя ошибка:*\n`{error_text}`\n"
+    
+    # Кнопки действий
+    keyboard = []
+    
+    # Первый ряд - основные действия
+    row1 = []
+    if account.is_active:
+        row1.append(InlineKeyboardButton("⏸️ Деактивировать", callback_data=f"deactivate_account_{account_id}"))
+    else:
+        row1.append(InlineKeyboardButton("▶️ Активировать", callback_data=f"activate_account_{account_id}"))
+    row1.append(InlineKeyboardButton("🔄 Проверить", callback_data=f"check_account_{account_id}"))
+    keyboard.append(row1)
+    
+    # Второй ряд - восстановление (только если есть проблемы)
+    if not account.is_active:
+        row_recovery = []
+        if account.email and account.email_password:
+            row_recovery.append(InlineKeyboardButton("🔧 IMAP восстановление", callback_data=f"imap_recover_{account_id}"))
+        row_recovery.append(InlineKeyboardButton("🚫 Сбросить ошибки", callback_data=f"reset_errors_{account_id}"))
+        keyboard.append(row_recovery)
+    
+    # Третий ряд - настройки
+    row3 = []
+    row3.append(InlineKeyboardButton("⚙️ Настройки", callback_data=f"account_settings_{account_id}"))
+    row3.append(InlineKeyboardButton("📊 Статистика", callback_data=f"account_stats_{account_id}"))
+    keyboard.append(row3)
+    
+    # Четвертый ряд - группы и прокси
+    row4 = []
+    row4.append(InlineKeyboardButton("📁 Группы", callback_data=f"manage_account_groups_{account_id}"))
+    row4.append(InlineKeyboardButton("🌐 Прокси", callback_data=f"manage_account_proxy_{account_id}"))
+    keyboard.append(row4)
+    
+    # Действия с контентом
+    keyboard.append([
+        InlineKeyboardButton("📤 Опубликовать", callback_data=f"publish_to_{account_id}"),
+        InlineKeyboardButton("🔥 Прогреть", callback_data=f"warm_account_{account_id}")
+    ])
+    
+    # Удаление и возврат
+    keyboard.append([
+        InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_account_{account_id}"),
+        InlineKeyboardButton("🔙 К списку", callback_data="list_accounts")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 def delete_account_handler(update, context):
     """Обработчик для удаления аккаунта"""
@@ -818,93 +980,205 @@ def confirm_delete_all_accounts_handler(update, context):
         )
 
 def check_accounts_validity_handler(update, context):
-    query = update.callback_query
-    query.answer()
-
-    query.edit_message_text("🔄 Проверка валидности аккаунтов... Это может занять некоторое время.")
-
-    session = get_session()
-    accounts = session.query(InstagramAccount).all()
-
-    if not accounts:
-        keyboard = [[InlineKeyboardButton("🔙 К меню аккаунтов", callback_data='menu_accounts')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        query.edit_message_text(
-            "У вас нет добавленных аккаунтов для проверки.",
-            reply_markup=reply_markup
-        )
-        session.close()
-        return
-
-    results = []
-
-    for account in accounts:
-        try:
-            client = Client()
-
-            # Проверяем наличие сессии
-            session_file = os.path.join(ACCOUNTS_DIR, str(account.id), 'session.json')
-            if os.path.exists(session_file):
-                try:
-                    with open(session_file, 'r') as f:
-                        session_data = json.load(f)
-
-                    if 'settings' in session_data:
-                        client.set_settings(session_data['settings'])
-
-                    # Проверяем валидность сессии
-                    try:
-                        client.get_timeline_feed()
-                        results.append((account.username, True, "Сессия валидна"))
-                        continue
-                    except:
-                        # Если сессия невалидна, пробуем войти с логином и паролем
-                        pass
-                except:
-                    pass
-
-            # Пробуем войти с логином и паролем
-            try:
-                client.login(account.username, account.password)
-
-                # Сохраняем обновленную сессию
-                os.makedirs(os.path.join(ACCOUNTS_DIR, str(account.id)), exist_ok=True)
-                session_data = {
-                    'username': account.username,
-                    'account_id': account.id,
-                    'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'settings': client.get_settings()
-                }
-                with open(session_file, 'w') as f:
-                    json.dump(session_data, f)
-
-                results.append((account.username, True, "Успешный вход"))
-            except Exception as e:
-                results.append((account.username, False, str(e)))
-        except Exception as e:
-            results.append((account.username, False, str(e)))
-
-    session.close()
-
-    # Формируем отчет
-    report = "📊 *Результаты проверки аккаунтов:*\n\n"
-
-    for username, is_valid, message in results:
-        status = "✅ Валиден" if is_valid else "❌ Невалиден"
-        report += f"👤 *{username}*: {status}\n"
-        if not is_valid:
-            report += f"📝 Причина: {message}\n"
-        report += "\n"
-
-    keyboard = [[InlineKeyboardButton("🔙 К списку аккаунтов", callback_data='list_accounts')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    query.edit_message_text(
-        report,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+    """Обработчик проверки валидности аккаунтов с новым селектором"""
+    from telegram_bot.utils.account_selection import create_account_selector
+    
+    # Создаем селектор аккаунтов для проверки
+    selector = create_account_selector(
+        callback_prefix="validity_select",
+        title="🔍 Проверка валидности аккаунтов",
+        allow_multiple=True,  # Разрешаем выбор нескольких аккаунтов
+        show_status=True,
+        show_folders=True,
+        back_callback="menu_accounts"
     )
+    
+    # Определяем callback для обработки выбранных аккаунтов
+    def on_accounts_selected(account_ids: list, update_inner, context_inner):
+        if account_ids:
+            query = update_inner.callback_query
+            
+            # Получаем адаптивные лимиты нагрузки
+            limits = get_adaptive_limits()
+            system_status = get_system_status()
+            
+            # Начинаем проверку
+            query.edit_message_text(
+                f"🔄 Проверка валидности аккаунтов...\n\n"
+                f"{system_status['emoji']} Система: {system_status['status'].upper()}\n"
+                f"⚙️ Потоков: {limits.max_workers}\n"
+                f"📦 Размер группы: {limits.batch_size}\n"
+                f"⏱️ Задержка: {limits.delay_between_batches}с"
+            )
+            
+            # Функция для проверки одного аккаунта
+            def check_single_account(account_id):
+                local_session = get_session()
+                try:
+                    account = local_session.query(InstagramAccount).filter_by(id=account_id).first()
+                    if not account:
+                        local_session.close()
+                        return (f"ID {account_id}", False, "Аккаунт не найден")
+                        
+                    # Используем специальную функцию для проверки аккаунтов с автоматическим получением кодов
+                    from instagram.client import test_instagram_login_with_proxy
+                    
+                    # Проверяем, есть ли у аккаунта данные почты
+                    email = getattr(account, 'email', None)
+                    email_password = getattr(account, 'email_password', None)
+                    
+                    if email and email_password:
+                        # Используем функцию с автоматическим получением кодов
+                        login_success = test_instagram_login_with_proxy(
+                            account_id=account.id,
+                            username=account.username,
+                            password=account.password,
+                            email=email,
+                            email_password=email_password
+                        )
+                        
+                        # ✅ ОБНОВЛЯЕМ СТАТУС В БАЗЕ ДАННЫХ
+                        from database.db_manager import update_instagram_account
+                        if login_success:
+                            update_instagram_account(account.id, is_active=True, last_check=datetime.now())
+                            local_session.close()
+                            return (account.username, True, "Успешный вход с автоматическим получением кодов")
+                        else:
+                            update_instagram_account(account.id, is_active=False, last_check=datetime.now())
+                            local_session.close()
+                            return (account.username, False, "Не удалось войти даже с автоматическим получением кодов")
+                    else:
+                        # Если нет данных почты, используем старый метод
+                        client = Client()
+
+                        # Проверяем наличие сессии
+                        session_file = os.path.join(ACCOUNTS_DIR, str(account.id), 'session.json')
+                        if os.path.exists(session_file):
+                            try:
+                                with open(session_file, 'r') as f:
+                                    session_data = json.load(f)
+
+                                if 'settings' in session_data:
+                                    client.set_settings(session_data['settings'])
+
+                                # Проверяем валидность сессии
+                                try:
+                                    client.get_timeline_feed()
+                                    # ✅ ОБНОВЛЯЕМ СТАТУС В БАЗЕ ДАННЫХ
+                                    from database.db_manager import update_instagram_account
+                                    update_instagram_account(account.id, is_active=True, last_check=datetime.now())
+                                    local_session.close()
+                                    return (account.username, True, "Сессия валидна")
+                                except:
+                                    # Если сессия невалидна, пробуем войти с логином и паролем
+                                    pass
+                            except:
+                                pass
+
+                        # Пробуем войти с логином и паролем
+                        try:
+                            client.login(account.username, account.password)
+
+                            # Сохраняем обновленную сессию
+                            os.makedirs(os.path.join(ACCOUNTS_DIR, str(account.id)), exist_ok=True)
+                            session_data = {
+                                'username': account.username,
+                                'account_id': account.id,
+                                'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'settings': client.get_settings()
+                            }
+                            with open(session_file, 'w') as f:
+                                json.dump(session_data, f)
+
+                            # ✅ ОБНОВЛЯЕМ СТАТУС В БАЗЕ ДАННЫХ
+                            from database.db_manager import update_instagram_account
+                            update_instagram_account(account.id, is_active=True, last_check=datetime.now())
+                            local_session.close()
+                            return (account.username, True, "Успешный вход")
+                        except Exception as e:
+                            # ✅ ОБНОВЛЯЕМ СТАТУС В БАЗЕ ДАННЫХ
+                            from database.db_manager import update_instagram_account
+                            update_instagram_account(account.id, is_active=False, last_check=datetime.now())
+                            local_session.close()
+                            return (account.username, False, str(e))
+                            
+                except Exception as e:
+                    account_name = account.username if 'account' in locals() and account else f"ID {account_id}"
+                    # ✅ ОБНОВЛЯЕМ СТАТУС В БАЗЕ ДАННЫХ ПРИ ОШИБКЕ
+                    try:
+                        from database.db_manager import update_instagram_account
+                        update_instagram_account(account_id, is_active=False, last_check=datetime.now())
+                    except:
+                        pass  # Игнорируем ошибки обновления при общих ошибках
+                    local_session.close()
+                    return (account_name, False, str(e))
+            
+            # Разбиваем аккаунты на группы согласно адаптивным лимитам
+            account_batches = [account_ids[i:i + limits.batch_size] for i in range(0, len(account_ids), limits.batch_size)]
+            results = []
+            
+            for batch_num, batch in enumerate(account_batches, 1):
+                # Обновляем прогресс
+                query.edit_message_text(
+                    f"🔄 Проверка группы {batch_num}/{len(account_batches)}...\n\n"
+                    f"{system_status['emoji']} Система: {system_status['status'].upper()}\n"
+                    f"⚙️ Потоков: {limits.max_workers}\n"
+                    f"📦 Аккаунтов в группе: {len(batch)}\n"
+                    f"⏱️ Задержка между группами: {limits.delay_between_batches}с"
+                )
+                
+                # Обрабатываем группу параллельно
+                with concurrent.futures.ThreadPoolExecutor(max_workers=limits.max_workers) as executor:
+                    # Запускаем проверку для всех аккаунтов в группе
+                    future_to_account = {
+                        executor.submit(check_single_account, account_id): account_id 
+                        for account_id in batch
+                    }
+                    
+                    # Ждем завершения с таймаутом
+                    timeout = 60 * limits.timeout_multiplier
+                    done, not_done = concurrent.futures.wait(future_to_account, timeout=timeout)
+                    
+                    # Собираем результаты
+                    for future in done:
+                        try:
+                            result = future.result()
+                            results.append(result)
+                        except Exception as e:
+                            account_id = future_to_account[future]
+                            results.append((f"ID {account_id}", False, f"Ошибка: {e}"))
+                    
+                    # Обрабатываем незавершенные задачи
+                    for future in not_done:
+                        account_id = future_to_account[future]
+                        results.append((f"ID {account_id}", False, "Превышен таймаут"))
+                        future.cancel()
+                
+                # Задержка между группами (кроме последней)
+                if batch_num < len(account_batches):
+                    time.sleep(limits.delay_between_batches)
+
+            # Формируем отчет
+            report = "📊 *Результаты проверки аккаунтов:*\n\n"
+
+            for username, is_valid, message in results:
+                status = "✅ Валиден" if is_valid else "❌ Невалиден"
+                report += f"👤 *{username}*: {status}\n"
+                if not is_valid:
+                    report += f"📝 Причина: {message}\n"
+                report += "\n"
+
+            keyboard = [[InlineKeyboardButton("🔙 К списку аккаунтов", callback_data='list_accounts')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            query.edit_message_text(
+                report,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    # Запускаем процесс выбора
+    return selector.start_selection(update, context, on_accounts_selected)
 
 def bulk_upload_accounts_command(update, context):
     if update.callback_query:
@@ -1275,6 +1549,17 @@ def async_upload_accounts_file(update, context):
 def get_account_handlers():
     """Возвращает обработчики для управления аккаунтами"""
     from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+    from telegram_bot.utils.account_selection import create_account_selector
+
+    # Создаем селектор для проверки валидности
+    validity_selector = create_account_selector(
+        callback_prefix="validity_select",
+        title="🔍 Проверка валидности аккаунтов",
+        allow_multiple=True,
+        show_status=True,
+        show_folders=True,
+        back_callback="menu_accounts"
+    )
 
     # Новый ConversationHandler для массовой загрузки аккаунтов
     bulk_upload_conversation = ConversationHandler(
@@ -1313,10 +1598,31 @@ def get_account_handlers():
         async_upload_conversation,
         CommandHandler("list_accounts", list_accounts_handler),
         CommandHandler("profile_setup", profile_setup_handler),
+        # Обработчики для списка аккаунтов с пагинацией
+        CallbackQueryHandler(list_accounts_handler, pattern='^list_accounts$'),
+        CallbackQueryHandler(list_accounts_handler, pattern='^list_accounts_page_\\d+$'),
+        validity_selector.get_conversation_handler(),  # Добавляем обработчик селектора для проверки
+        # Обработчик деталей аккаунта
+        CallbackQueryHandler(account_details_handler, pattern='^account_details_\\d+$'),
+        # Обработчики действий с аккаунтом
         CallbackQueryHandler(delete_account_handler, pattern='^delete_account_\\d+$'),
         CallbackQueryHandler(delete_all_accounts_handler, pattern='^delete_all_accounts$'),
+        # Новые обработчики для IMAP восстановления и сброса ошибок
+        CallbackQueryHandler(imap_recover_handler, pattern='^imap_recover_\\d+$'),
+        CallbackQueryHandler(reset_errors_handler, pattern='^reset_errors_\\d+$'),
         CallbackQueryHandler(confirm_delete_all_accounts_handler, pattern='^confirm_delete_all_accounts$'),
-        CallbackQueryHandler(check_accounts_validity_handler, pattern='^check_accounts_validity$')
+        CallbackQueryHandler(check_accounts_validity_handler, pattern='^check_accounts_validity$'),
+        # Обработчики активации/деактивации аккаунтов
+        CallbackQueryHandler(activate_account_handler, pattern='^activate_account_\\d+$'),
+        CallbackQueryHandler(deactivate_account_handler, pattern='^deactivate_account_\\d+$'),
+        CallbackQueryHandler(check_single_account_handler, pattern='^check_account_\\d+$'),
+        CallbackQueryHandler(account_settings_handler, pattern='^account_settings_\\d+$'),
+        CallbackQueryHandler(account_stats_handler, pattern='^account_stats_\\d+$'),
+        CallbackQueryHandler(manage_account_groups_handler, pattern='^manage_account_groups_\\d+$'),
+        CallbackQueryHandler(manage_account_proxy_handler, pattern='^manage_account_proxy_\\d+$'),
+        CallbackQueryHandler(publish_to_account_handler, pattern='^publish_to_\\d+$'),
+        CallbackQueryHandler(warm_account_handler, pattern='^warm_account_\\d+$'),
+        CallbackQueryHandler(lambda u, c: u.callback_query.answer("В разработке"), pattern='^search_accounts$'),
     ]
 
 def bulk_add_accounts_command(update, context):
@@ -1454,122 +1760,6 @@ def bulk_add_accounts_command(update, context):
         failed_list = "❌ Список неудачно добавленных аккаунтов:\n" + "\n".join(failed_accounts_list)
         update.message.reply_text(failed_list)
 
-def bulk_add_accounts_text(update, context):
-    """Обработчик текстового сообщения с списком аккаунтов"""
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    # Разбиваем текст на строки
-    accounts_lines = text.split("\n")
-
-    # Статистика
-    total_accounts = len(accounts_lines)
-    added_accounts = 0
-    failed_accounts = 0
-    already_exists = 0
-    failed_accounts_list = []
-
-    update.message.reply_text(f"🔄 Начинаем добавление {total_accounts} аккаунтов...")
-
-    # Обрабатываем каждую строку
-    for line in accounts_lines:
-        line = line.strip()
-        if not line:
-            continue
-
-        parts = line.split(":")
-        if len(parts) != 4:
-            update.message.reply_text(f"❌ Неверный формат строки: {line}")
-            failed_accounts += 1
-            failed_accounts_list.append(f"{line} - неверный формат")
-            continue
-
-        username, password, email, email_password = parts
-
-        # Проверяем, существует ли уже аккаунт с таким именем
-        session = get_session()
-        existing_account = session.query(InstagramAccount).filter_by(username=username).first()
-        session.close()
-
-        if existing_account:
-            update.message.reply_text(f"⚠️ Аккаунт {username} уже существует в базе данных.")
-            already_exists += 1
-            continue
-
-        try:
-            # Добавляем аккаунт в базу данных без проверки входа
-            from database.db_manager import add_instagram_account_without_login
-
-            account = add_instagram_account_without_login(
-                username=username,
-                password=password,
-                email=email,
-                email_password=email_password
-            )
-
-            if not account:
-                update.message.reply_text(f"❌ Не удалось добавить аккаунт {username} в базу данных.")
-                failed_accounts += 1
-                failed_accounts_list.append(f"{username} - ошибка добавления в БД")
-                continue
-
-            # Назначаем прокси для аккаунта
-            from utils.proxy_manager import assign_proxy_to_account
-            proxy_success, proxy_message = assign_proxy_to_account(account.id)
-
-            if not proxy_success:
-                update.message.reply_text(f"⚠️ {username}: {proxy_message}")
-
-            # Проверяем подключение к почте
-            from instagram.email_utils import test_email_connection
-            email_success, email_message = test_email_connection(email, email_password)
-
-            if not email_success:
-                update.message.reply_text(f"⚠️ {username}: Ошибка подключения к почте: {email_message}")
-                # Продолжаем, даже если не удалось подключиться к почте
-
-            # Пытаемся войти в Instagram с использованием прокси
-            from instagram.client import test_instagram_login_with_proxy
-            login_success = test_instagram_login_with_proxy(
-                account_id=account.id,
-                username=username,
-                password=password,
-                email=email,
-                email_password=email_password
-            )
-
-            if login_success:
-                # Если вход успешен, активируем аккаунт
-                from database.db_manager import activate_instagram_account
-                activate_instagram_account(account.id)
-                update.message.reply_text(f"✅ Аккаунт {username} успешно добавлен и активирован!")
-            else:
-                update.message.reply_text(f"⚠️ Аккаунт {username} добавлен, но не удалось войти в Instagram.")
-
-            added_accounts += 1
-
-        except Exception as e:
-            update.message.reply_text(f"❌ Ошибка при добавлении аккаунта {username}: {str(e)}")
-            logger.error(f"Ошибка при добавлении аккаунта {username}: {str(e)}")
-            failed_accounts += 1
-            failed_accounts_list.append(f"{username} - {str(e)}")
-
-    # Отправляем итоговую статистику
-    summary = (
-        f"📊 Итоги добавления аккаунтов:\n"
-        f"Всего обработано: {total_accounts}\n"
-        f"Успешно добавлено: {added_accounts}\n"
-        f"Уже существуют: {already_exists}\n"
-        f"Не удалось добавить: {failed_accounts}"
-    )
-
-    update.message.reply_text(summary)
-
-    # Если есть неудачные аккаунты, отправляем их список
-    if failed_accounts_list:
-        failed_list = "❌ Список неудачно добавленных аккаунтов:\n" + "\n".join(failed_accounts_list)
-        update.message.reply_text(failed_list)
-
     # Возвращаем клавиатуру меню аккаунтов
     keyboard = [
         [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='add_account')],
@@ -1583,3 +1773,635 @@ def bulk_add_accounts_text(update, context):
     context.user_data['waiting_for_bulk_accounts'] = False
 
     return ConversationHandler.END
+
+def imap_recover_handler(update, context):
+    """Обработчик IMAP восстановления аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("imap_recover_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    if not account.email or not account.email_password:
+        query.edit_message_text(
+            f"❌ У аккаунта @{account.username} нет данных email для восстановления",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"account_details_{account_id}")]])
+        )
+        return
+    
+    # Показываем сообщение о начале восстановления
+    query.edit_message_text(
+        f"🔄 Начинаю IMAP восстановление для @{account.username}...\n\n"
+        f"📧 Email: {account.email}\n"
+        f"⏳ Это может занять до 2 минут"
+    )
+    
+    try:
+        # Импортируем функции для восстановления
+        from instagram.email_utils import get_verification_code_from_email
+        from instagram.client import InstagramClient
+        from database.db_manager import update_instagram_account
+        from datetime import datetime
+        
+        # Создаем новый клиент для восстановления
+        instagram_client = InstagramClient(account_id)
+        
+        # Пытаемся получить код верификации из почты
+        verification_code = get_verification_code_from_email(
+            account.email, 
+            account.email_password, 
+            max_attempts=3, 
+            delay_between_attempts=15
+        )
+        
+        if verification_code:
+            # Пытаемся войти с кодом верификации
+            login_success = instagram_client.login_with_challenge_code(verification_code)
+            if login_success:
+                # Проверяем что восстановление прошло успешно
+                try:
+                    instagram_client.client.get_timeline_feed()
+                    # Обновляем статус в БД как активный
+                    update_instagram_account(
+                        account_id,
+                        is_active=True,
+                        status="active",
+                        last_error=None,
+                        last_check=datetime.now()
+                    )
+                    
+                    query.edit_message_text(
+                        f"✅ IMAP восстановление успешно!\n\n"
+                        f"👤 Аккаунт: @{account.username}\n"
+                        f"📧 Код получен из: {account.email}\n"
+                        f"✅ Статус: Активен",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+                    )
+                except Exception as verify_error:
+                    update_instagram_account(
+                        account_id,
+                        is_active=False,
+                        status="recovery_verify_failed",
+                        last_error=f"Восстановление не подтвердилось: {verify_error}",
+                        last_check=datetime.now()
+                    )
+                    
+                    query.edit_message_text(
+                        f"❌ Восстановление не подтвердилось\n\n"
+                        f"👤 Аккаунт: @{account.username}\n"
+                        f"⚠️ Ошибка: {str(verify_error)[:100]}",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+                    )
+            else:
+                update_instagram_account(
+                    account_id,
+                    is_active=False,
+                    status="recovery_login_failed",
+                    last_error="Не удалось войти с кодом верификации",
+                    last_check=datetime.now()
+                )
+                
+                query.edit_message_text(
+                    f"❌ Не удалось войти с кодом верификации\n\n"
+                    f"👤 Аккаунт: @{account.username}\n"
+                    f"📧 Email: {account.email}\n"
+                    f"🔐 Код получен, но вход не удался",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+                )
+        else:
+            update_instagram_account(
+                account_id,
+                is_active=False,
+                status="email_code_failed",
+                last_error="Не удалось получить код из email",
+                last_check=datetime.now()
+            )
+            
+            query.edit_message_text(
+                f"❌ Не удалось получить код из email\n\n"
+                f"👤 Аккаунт: @{account.username}\n"
+                f"📧 Email: {account.email}\n"
+                f"⚠️ Проверьте доступность почтового ящика",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+            )
+            
+    except Exception as e:
+        error_msg = str(e) if e else "Unknown error"
+        
+        # Определяем тип ошибки
+        if error_msg and "challenge_required" in error_msg.lower():
+            error_type = "challenge_required"
+        elif error_msg and "login_required" in error_msg.lower():
+            error_type = "login_required"
+        elif error_msg and "email" in error_msg.lower():
+            error_type = "email_error"
+        else:
+            error_type = "recovery_error"
+        
+        update_instagram_account(
+            account_id,
+            is_active=False,
+            status=error_type,
+            last_error=error_msg,
+            last_check=datetime.now()
+        )
+        
+        query.edit_message_text(
+            f"❌ Ошибка при восстановлении\n\n"
+            f"👤 Аккаунт: @{account.username}\n"
+            f"⚠️ Ошибка: {error_msg[:100]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+        )
+
+def reset_errors_handler(update, context):
+    """Обработчик сброса ошибок аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("reset_errors_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    try:
+        from database.db_manager import update_instagram_account
+        from datetime import datetime
+        
+        # Сбрасываем ошибки и статус
+        update_instagram_account(
+            account_id,
+            status="active",
+            last_error=None,
+            last_check=datetime.now()
+        )
+        
+        query.edit_message_text(
+            f"✅ Ошибки сброшены\n\n"
+            f"👤 Аккаунт: @{account.username}\n"
+            f"🔄 Статус сброшен на 'active'\n"
+            f"🚫 Последняя ошибка очищена\n\n"
+            f"ℹ️ Аккаунт будет проверен при следующем использовании",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+        )
+        
+    except Exception as e:
+        query.edit_message_text(
+            f"❌ Ошибка при сбросе\n\n"
+            f"👤 Аккаунт: @{account.username}\n"
+            f"⚠️ Ошибка: {str(e)[:100]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]])
+        )
+
+
+def activate_account_handler(update, context):
+    """Активирует аккаунт"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("activate_account_", ""))
+    
+    # Показываем процесс активации
+    query.edit_message_text(
+        f"🔄 Активирую аккаунт...\n\n"
+        f"Выполняется проверка входа и восстановление сессии.\n"
+        f"Пожалуйста, подождите..."
+    )
+    
+    try:
+        account = get_instagram_account(account_id)
+        if not account:
+            query.edit_message_text("❌ Аккаунт не найден")
+            return
+        
+        # Пытаемся войти в аккаунт и создать сессию
+        from instagram.client import test_instagram_login_with_proxy
+        
+        success = test_instagram_login_with_proxy(
+            account_id=account_id,
+            username=account.username,
+            password=account.password,
+            email=account.email,
+            email_password=account.email_password
+        )
+        
+        if success:
+            # Активируем аккаунт
+            activate_instagram_account(account_id)
+            
+            keyboard = [[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query.edit_message_text(
+                f"✅ Аккаунт @{account.username} успешно активирован!\n\n"
+                f"🔐 Сессия создана и сохранена\n"
+                f"📡 Прокси настроен\n"
+                f"✅ Готов к использованию",
+                reply_markup=reply_markup
+            )
+        else:
+            keyboard = [
+                [InlineKeyboardButton("🔧 IMAP восстановление", callback_data=f"imap_recover_{account_id}")],
+                [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query.edit_message_text(
+                f"⚠️ Не удалось активировать аккаунт @{account.username}\n\n"
+                f"Возможные причины:\n"
+                f"• Требуется код подтверждения\n"
+                f"• Неверные данные входа\n"
+                f"• Аккаунт заблокирован\n\n"
+                f"Попробуйте IMAP восстановление:",
+                reply_markup=reply_markup
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка при активации аккаунта {account_id}: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"❌ Ошибка при активации аккаунта:\n{str(e)}",
+            reply_markup=reply_markup
+        )
+
+def deactivate_account_handler(update, context):
+    """Деактивирует аккаунт"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("deactivate_account_", ""))
+    
+    try:
+        account = get_instagram_account(account_id)
+        if not account:
+            query.edit_message_text("❌ Аккаунт не найден")
+            return
+        
+        # Деактивируем аккаунт
+        from database.db_manager import update_instagram_account
+        update_instagram_account(account_id, is_active=False, status='manually_deactivated')
+        
+        keyboard = [[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"⏸️ Аккаунт @{account.username} деактивирован\n\n"
+            f"Аккаунт больше не будет использоваться для:\n"
+            f"• Публикации контента\n"
+            f"• Прогрева\n"
+            f"• Автоматических действий\n\n"
+            f"Вы можете активировать его снова в любое время.",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при деактивации аккаунта {account_id}: {e}")
+        query.edit_message_text(f"❌ Ошибка: {str(e)}")
+
+def check_single_account_handler(update, context):
+    """Проверяет состояние одного аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("check_account_", ""))
+    
+    query.edit_message_text(
+        f"🔍 Проверяю состояние аккаунта...\n\n"
+        f"Выполняется:\n"
+        f"• Проверка подключения к Instagram\n"
+        f"• Проверка прокси\n"
+        f"• Проверка email доступа\n"
+        f"• Анализ последних ошибок"
+    )
+    
+    try:
+        account = get_instagram_account(account_id)
+        if not account:
+            query.edit_message_text("❌ Аккаунт не найден")
+            return
+        
+        report = []
+        overall_status = "✅"
+        
+        # 1. Проверка Instagram подключения
+        from instagram.client import test_instagram_login_with_proxy
+        instagram_ok = test_instagram_login_with_proxy(
+            account_id=account_id,
+            username=account.username,
+            password=account.password,
+            email=account.email,
+            email_password=account.email_password
+        )
+        
+        if instagram_ok:
+            report.append("✅ Instagram: Подключение работает")
+        else:
+            report.append("❌ Instagram: Ошибка подключения")
+            overall_status = "❌"
+        
+        # 2. Проверка email
+        if account.email and account.email_password:
+            from instagram.email_utils import test_email_connection
+            email_ok, email_msg = test_email_connection(account.email, account.email_password)
+            if email_ok:
+                report.append("✅ Email: Подключение работает")
+            else:
+                report.append(f"❌ Email: {email_msg}")
+                overall_status = "⚠️"
+        else:
+            report.append("⚠️ Email: Данные не указаны")
+            
+        # 3. Проверка прокси
+        if account.proxy:
+            report.append(f"✅ Прокси: {account.proxy.host}:{account.proxy.port}")
+        else:
+            report.append("⚠️ Прокси: Не назначен")
+            overall_status = "⚠️"
+        
+        # 4. Обновляем время последней проверки
+        from database.db_manager import update_instagram_account
+        from datetime import datetime
+        update_instagram_account(account_id, last_check=datetime.now())
+        
+        # Формируем итоговый отчет
+        status_text = {
+            "✅": "Исправен",
+            "⚠️": "Есть предупреждения", 
+            "❌": "Есть проблемы"
+        }
+        
+        text = f"🔍 РЕЗУЛЬТАТ ПРОВЕРКИ\n\n"
+        text += f"👤 Аккаунт: @{account.username}\n"
+        text += f"📊 Общий статус: {overall_status} {status_text[overall_status]}\n\n"
+        text += f"📋 Детали:\n"
+        for item in report:
+            text += f"  {item}\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_account_{account_id}")],
+            [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(text, reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при проверке аккаунта {account_id}: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"❌ Ошибка при проверке аккаунта:\n{str(e)}",
+            reply_markup=reply_markup
+        )
+
+def account_settings_handler(update, context):
+    """Настройки аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("account_settings_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    text = f"⚙️ НАСТРОЙКИ АККАУНТА\n\n"
+    text += f"👤 @{account.username}\n\n"
+    text += f"🔧 Доступные настройки:"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔑 Изменить пароль", callback_data=f"change_password_{account_id}")],
+        [InlineKeyboardButton("📧 Изменить email", callback_data=f"change_email_{account_id}")],
+        [InlineKeyboardButton("🌐 Сменить прокси", callback_data=f"change_proxy_{account_id}")],
+        [InlineKeyboardButton("📱 Сбросить устройство", callback_data=f"reset_device_{account_id}")],
+        [InlineKeyboardButton("🗂️ Управление группами", callback_data=f"manage_account_groups_{account_id}")],
+        [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(text, reply_markup=reply_markup)
+
+def account_stats_handler(update, context):
+    """Статистика аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("account_stats_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    try:
+        # Получаем статистику публикаций из базы
+        session = get_session()
+        from database.models import PublishTask
+        
+        # Подсчитываем публикации
+        total_posts = session.query(PublishTask).filter_by(account_id=account_id).count()
+        completed_posts = session.query(PublishTask).filter_by(account_id=account_id, status='completed').count()
+        failed_posts = session.query(PublishTask).filter_by(account_id=account_id, status='failed').count()
+        pending_posts = session.query(PublishTask).filter_by(account_id=account_id, status='pending').count()
+        
+        session.close()
+        
+        # Рассчитываем процент успеха
+        success_rate = (completed_posts / total_posts * 100) if total_posts > 0 else 0
+        
+        text = f"📊 СТАТИСТИКА АККАУНТА\n\n"
+        text += f"👤 @{account.username}\n"
+        text += f"📅 Добавлен: {account.created_at.strftime('%d.%m.%Y')}\n\n"
+        
+        text += f"📈 ПУБЛИКАЦИИ:\n"
+        text += f"  📤 Всего: {total_posts}\n"
+        text += f"  ✅ Успешно: {completed_posts}\n"
+        text += f"  ❌ Ошибок: {failed_posts}\n"
+        text += f"  ⏳ Ожидает: {pending_posts}\n"
+        text += f"  📊 Успешность: {success_rate:.1f}%\n\n"
+        
+        if account.last_check:
+            text += f"🔍 Последняя проверка: {account.last_check.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        # Информация о группах
+        if account.groups:
+            text += f"\n📁 Группы: {', '.join([g.name for g in account.groups])}\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Детальная аналитика", callback_data=f"detailed_analytics_{account_id}")],
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"account_stats_{account_id}")],
+            [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(text, reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении статистики аккаунта {account_id}: {e}")
+        query.edit_message_text(f"❌ Ошибка получения статистики: {str(e)}")
+
+def manage_account_groups_handler(update, context):
+    """Управление группами аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("manage_account_groups_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    # Получаем все доступные группы
+    session = get_session()
+    from database.models import AccountGroup
+    all_groups = session.query(AccountGroup).all()
+    current_groups = account.groups
+    session.close()
+    
+    text = f"📁 УПРАВЛЕНИЕ ГРУППАМИ\n\n"
+    text += f"👤 @{account.username}\n\n"
+    
+    if current_groups:
+        text += f"📌 Текущие группы:\n"
+        for group in current_groups:
+            text += f"  {group.icon} {group.name}\n"
+        text += "\n"
+    else:
+        text += f"📌 Аккаунт не состоит в группах\n\n"
+    
+    text += f"🔧 Доступные действия:"
+    
+    keyboard = []
+    
+    # Кнопки для добавления в группы
+    if all_groups:
+        keyboard.append([InlineKeyboardButton("➕ Добавить в группу", callback_data=f"add_to_group_{account_id}")])
+    
+    # Кнопки для удаления из групп
+    if current_groups:
+        keyboard.append([InlineKeyboardButton("➖ Удалить из группы", callback_data=f"remove_from_group_{account_id}")])
+    
+    # Создание новой группы
+    keyboard.append([InlineKeyboardButton("📂 Создать новую группу", callback_data=f"create_group_{account_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    query.edit_message_text(text, reply_markup=reply_markup)
+
+def manage_account_proxy_handler(update, context):
+    """Управление прокси аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("manage_account_proxy_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    text = f"🌐 УПРАВЛЕНИЕ ПРОКСИ\n\n"
+    text += f"👤 @{account.username}\n\n"
+    
+    if account.proxy:
+        text += f"📡 Текущий прокси:\n"
+        text += f"  🌐 {account.proxy.host}:{account.proxy.port}\n"
+        text += f"  📊 Статус: {'✅ Активен' if account.proxy.is_active else '❌ Неактивен'}\n\n"
+    else:
+        text += f"📡 Прокси: Не назначен\n\n"
+    
+    text += f"🔧 Доступные действия:"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Сменить прокси", callback_data=f"change_proxy_{account_id}")],
+        [InlineKeyboardButton("🧪 Проверить прокси", callback_data=f"test_proxy_{account_id}")],
+    ]
+    
+    if account.proxy:
+        keyboard.append([InlineKeyboardButton("📊 Статистика прокси", callback_data=f"proxy_stats_{account_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    query.edit_message_text(text, reply_markup=reply_markup)
+
+def publish_to_account_handler(update, context):
+    """Быстрая публикация в аккаунт"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("publish_to_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    # Сохраняем выбранный аккаунт для публикации
+    context.user_data['publish_account_id'] = account_id
+    context.user_data['publish_account_username'] = account.username
+    context.user_data['selected_accounts'] = [account_id]
+    
+    text = f"📤 БЫСТРАЯ ПУБЛИКАЦИЯ\n\n"
+    text += f"👤 Выбран: @{account.username}\n\n"
+    text += f"📋 Выберите тип публикации:"
+    
+    keyboard = [
+        [InlineKeyboardButton("📸 Пост", callback_data="start_post_publish")],
+        [InlineKeyboardButton("📱 Story", callback_data="start_story_publish")],
+        [InlineKeyboardButton("🎥 Reels", callback_data="start_reels_publish")],
+        [InlineKeyboardButton("🎬 IGTV", callback_data="start_igtv_publish")],
+        [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(text, reply_markup=reply_markup)
+
+def warm_account_handler(update, context):
+    """Запуск прогрева аккаунта"""
+    query = update.callback_query
+    query.answer()
+    
+    account_id = int(query.data.replace("warm_account_", ""))
+    account = get_instagram_account(account_id)
+    
+    if not account:
+        query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    if not account.is_active:
+        keyboard = [[InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"⚠️ Аккаунт @{account.username} неактивен\n\n"
+            f"Для прогрева необходимо сначала активировать аккаунт.",
+            reply_markup=reply_markup
+        )
+        return
+    
+    text = f"🔥 ПРОГРЕВ АККАУНТА\n\n"
+    text += f"👤 @{account.username}\n\n"
+    text += f"🎯 Выберите тип прогрева:"
+    
+    keyboard = [
+        [InlineKeyboardButton("⚡ Быстрый прогрев", callback_data=f"quick_warmup_{account_id}")],
+        [InlineKeyboardButton("🎯 Умный прогрев", callback_data=f"smart_warmup_{account_id}")],
+        [InlineKeyboardButton("🎨 Прогрев по интересам", callback_data=f"interest_warmup_{account_id}")],
+        [InlineKeyboardButton("📊 Настройки прогрева", callback_data=f"warmup_settings_{account_id}")],
+        [InlineKeyboardButton("🔙 К деталям", callback_data=f"account_details_{account_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(text, reply_markup=reply_markup)
+
